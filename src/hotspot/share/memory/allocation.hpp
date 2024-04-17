@@ -370,8 +370,11 @@ class MetaspaceObj {
   f(ConstantPoolCache) \
   f(Annotations) \
   f(MethodCounters) \
-  f(SharedClassPathEntry) \
-  f(RecordComponent)
+  f(RecordComponent) \
+  f(KlassTrainingData) \
+  f(MethodTrainingData) \
+  f(CompileTrainingData) \
+  f(SharedClassPathEntry)
 
 #define METASPACE_OBJ_TYPE_DECLARE(name) name ## Type,
 #define METASPACE_OBJ_TYPE_NAME_CASE(name) case name ## Type: return #name;
@@ -389,6 +392,12 @@ class MetaspaceObj {
       ShouldNotReachHere();
       return nullptr;
     }
+  }
+
+  static bool is_training_data(Type type) {
+    return (type == Type::KlassTrainingDataType)  ||
+           (type == Type::MethodTrainingDataType) ||
+           (type == Type::CompileTrainingDataType);
   }
 
   static MetaspaceObj::Type array_type(size_t elem_size) {

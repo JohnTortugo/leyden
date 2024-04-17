@@ -33,12 +33,14 @@
 #include "cds/filemap.hpp"
 #include "cds/heapShared.hpp"
 #include "cds/metaspaceShared.hpp"
+#include "classfile/classLoader.hpp"
 #include "classfile/systemDictionaryShared.hpp"
 #include "classfile/vmClasses.hpp"
 #include "interpreter/bootstrapInfo.hpp"
 #include "memory/metaspaceUtils.hpp"
 #include "memory/resourceArea.hpp"
 #include "oops/compressedOops.inline.hpp"
+#include "oops/klass.inline.hpp"
 #include "runtime/arguments.hpp"
 #include "utilities/bitMap.inline.hpp"
 #include "utilities/debug.hpp"
@@ -227,9 +229,10 @@ void DumpRegion::append_intptr_t(intptr_t n, bool need_to_mark) {
 }
 
 void DumpRegion::print(size_t total_bytes) const {
+  char* base = used() > 0 ? ArchiveBuilder::current()->to_requested(_base) : nullptr;
   log_debug(cds)("%s space: " SIZE_FORMAT_W(9) " [ %4.1f%% of total] out of " SIZE_FORMAT_W(9) " bytes [%5.1f%% used] at " INTPTR_FORMAT,
                  _name, used(), percent_of(used(), total_bytes), reserved(), percent_of(used(), reserved()),
-                 p2i(ArchiveBuilder::current()->to_requested(_base)));
+                 p2i(base));
 }
 
 void DumpRegion::print_out_of_space_msg(const char* failing_region, size_t needed_bytes) {
@@ -252,9 +255,10 @@ void DumpRegion::init(ReservedSpace* rs, VirtualSpace* vs) {
 }
 
 void DumpRegion::pack(DumpRegion* next) {
-  assert(!is_packed(), "sanity");
-  _end = (char*)align_up(_top, MetaspaceShared::core_region_alignment());
-  _is_packed = true;
+  if (!is_packed()) {
+    _end = (char*)align_up(_top, MetaspaceShared::core_region_alignment());
+    _is_packed = true;
+  }
   if (next != nullptr) {
     next->_rs = _rs;
     next->_vs = _vs;
@@ -340,7 +344,7 @@ void ArchiveUtils::log_to_classlist(BootstrapInfo* bootstrap_specifier, TRAPS) {
         ResourceMark rm(THREAD);
         int pool_index = bootstrap_specifier->bss_index();
         ClassListWriter w;
-        w.stream()->print("%s %s", LAMBDA_PROXY_TAG, pool->pool_holder()->name()->as_C_string());
+        w.stream()->print("%s %s", ClassListParser::lambda_proxy_tag(), pool->pool_holder()->name()->as_C_string());
         CDSIndyInfo cii;
         ClassListParser::populate_cds_indy_info(pool, pool_index, &cii, CHECK);
         GrowableArray<const char*>* indy_items = cii.items();
@@ -350,5 +354,80 @@ void ArchiveUtils::log_to_classlist(BootstrapInfo* bootstrap_specifier, TRAPS) {
         w.stream()->cr();
       }
     }
+  }
+}
+
+// Used in logging: "boot", "boot2", "plat", "app" and "unreg";
+const char* ArchiveUtils::class_category(Klass* k) {
+  if (k->is_array_klass()) {
+    return "array";
+  } else {
+    oop loader = k->class_loader();
+    if (loader == nullptr) {
+      if (k->module() != nullptr &&
+          k->module()->name() != nullptr &&
+          k->module()->name()->equals("java.base")) {
+        return "boot"; // all boot classes in java.base -- they are loaded first with PreloadSharedClasses
+      } else {
+        return "boot2"; // other boot classes -- they are loaded in a second phase with PreloadSharedClasses
+      }
+    } else {
+      if (loader == SystemDictionary::java_platform_loader()) {
+        return "plat";
+      } else if (loader == SystemDictionary::java_system_loader()) {
+        return "app";
+      } else {
+        return "unreg";
+      }
+    }
+  }
+}
+
+// "boot", "platform", "app" or nullptr
+const char* ArchiveUtils::builtin_loader_name_or_null(oop loader) {
+  if (loader == nullptr) {
+    return "boot";
+  } else if (loader == SystemDictionary::java_platform_loader()) {
+    return "platform";
+  } else if (loader == SystemDictionary::java_system_loader()) {
+    return "app";
+  } else {
+    return nullptr;
+  }
+}
+
+// "boot", "platform", "app". Asserts if not a built-in-loader
+const char* ArchiveUtils::builtin_loader_name(oop loader) {
+  const char* name = builtin_loader_name_or_null(loader);
+  assert(name != nullptr, "must be a built-in loader");
+  return name;
+}
+
+bool ArchiveUtils::builtin_loader_from_type(const char* loader_type, oop* value_ret) {
+  if (strcmp(loader_type, "boot") == 0) {
+    *value_ret = nullptr;
+    return true;
+  } else if (strcmp(loader_type, "platform") == 0) {
+    *value_ret = SystemDictionary::java_platform_loader();
+    return true;
+  } else if (strcmp(loader_type, "app") == 0) {
+    *value_ret = SystemDictionary::java_system_loader();
+    return true;
+  } else {
+    DEBUG_ONLY(*value_ret = cast_to_oop((void*)badOopVal));
+    return false;
+  }
+}
+
+oop ArchiveUtils::builtin_loader_from_type(int loader_type) {
+  if (loader_type == ClassLoader::BOOT_LOADER) {
+    return nullptr;
+  } else if (loader_type == ClassLoader::PLATFORM_LOADER)  {
+    return SystemDictionary::java_platform_loader();
+  } else if (loader_type == ClassLoader::APP_LOADER) {
+    return SystemDictionary::java_system_loader();
+  } else {
+    ShouldNotReachHere();
+    return nullptr;
   }
 }

@@ -488,6 +488,8 @@ JavaThread::JavaThread() :
   _held_monitor_count(0),
   _jni_monitor_count(0),
 
+  _can_call_java(true),
+
   _handshake(this),
 
   _popframe_preserved_args(nullptr),
@@ -501,6 +503,7 @@ JavaThread::JavaThread() :
   _parker(),
 
   _class_to_be_initialized(nullptr),
+  _class_being_initialized(nullptr),
 
   _SleepEvent(ParkEvent::Allocate(this)),
 
@@ -955,7 +958,7 @@ void JavaThread::exit(bool destroy_vm, ExitType exit_type) {
   // We need to cache the thread name for logging purposes below as once
   // we have called on_thread_detach this thread must not access any oops.
   char* thread_name = nullptr;
-  if (log_is_enabled(Debug, os, thread, timer)) {
+  if (log_is_enabled(Debug, os, thread, timer) || (CountBytecodesPerThread && log_is_enabled(Info, init))) {
     ResourceMark rm(this);
     thread_name = os::strdup(name());
   }
@@ -978,6 +981,11 @@ void JavaThread::exit(bool destroy_vm, ExitType exit_type) {
     }
   }
 #endif // INCLUDE_JVMCI
+
+  if (bc_counter_value() > 0) {
+    log_info(init)("Thread '%s': " JLONG_FORMAT " bytecodes executed (during clinit: " JLONG_FORMAT ")",
+                   thread_name, bc_counter_value(), clinit_bc_counter_value());
+  }
 
   // Remove from list of active threads list, and notify VM thread if we are the last non-daemon thread.
   // We call BarrierSet::barrier_set()->on_thread_detach() here so no touching of oops after this point.
@@ -1752,23 +1760,28 @@ oop JavaThread::current_park_blocker() {
 void JavaThread::print_jni_stack() {
   assert(this == JavaThread::current(), "Can't print stack of other threads");
   if (!has_last_Java_frame()) {
-    ResourceMark rm(this);
-    char* buf = NEW_RESOURCE_ARRAY_RETURN_NULL(char, O_BUFLEN);
-    if (buf == nullptr) {
-      tty->print_cr("Unable to print native stack - out of memory");
-      return;
-    }
-    address lastpc = nullptr;
-    if (os::platform_print_native_stack(tty, nullptr, buf, O_BUFLEN, lastpc)) {
-      // We have printed the native stack in platform-specific code,
-      // so nothing else to do in this case.
-    } else {
-      frame f = os::current_frame();
-      VMError::print_native_stack(tty, f, this, true /*print_source_info */,
-                                  -1 /* max stack */, buf, O_BUFLEN);
-    }
+    print_native_stack_on(tty);
   } else {
     print_active_stack_on(tty);
+  }
+}
+
+void JavaThread::print_native_stack_on(outputStream *st) {
+  assert(this == JavaThread::current(), "Can't print stack of other threads");
+  ResourceMark rm;
+  char* buf = NEW_RESOURCE_ARRAY_RETURN_NULL(char, O_BUFLEN);
+  if (buf == nullptr) {
+    st->print_cr("Unable to print native stack - out of memory");
+    return;
+  }
+  address lastpc = nullptr;
+  if (os::platform_print_native_stack(st, nullptr, buf, O_BUFLEN, lastpc)) {
+    // We have printed the native stack in platform-specific code,
+    // so nothing else to do in this case.
+  } else {
+    frame f = os::current_frame();
+    VMError::print_native_stack(st, f, this, true /*print_source_info */,
+                                -1 /* max stack */, buf, O_BUFLEN);
   }
 }
 

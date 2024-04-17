@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -181,7 +181,7 @@ class SharedRuntime: AllStatic {
   static address exception_handler_for_return_address(JavaThread* current, address return_address);
 
   // exception handling and implicit exceptions
-  static address compute_compiled_exc_handler(CompiledMethod* nm, address ret_pc, Handle& exception,
+  static address compute_compiled_exc_handler(nmethod* nm, address ret_pc, Handle& exception,
                                               bool force_unwind, bool top_frame_only, bool& recursive_exception_occurred);
   enum ImplicitExceptionKind {
     IMPLICIT_NULL,
@@ -328,7 +328,7 @@ class SharedRuntime: AllStatic {
   // deopt blob
   static void generate_deopt_blob(void);
 
-  static bool handle_ic_miss_helper_internal(Handle receiver, CompiledMethod* caller_nm, const frame& caller_frame,
+  static bool handle_ic_miss_helper_internal(Handle receiver, nmethod* caller_nm, const frame& caller_frame,
                                              methodHandle callee_method, Bytecodes::Code bc, CallInfo& call_info,
                                              bool& needs_ic_stub_refill, TRAPS);
 
@@ -513,6 +513,21 @@ class SharedRuntime: AllStatic {
 
   static address handle_unsafe_access(JavaThread* thread, address next_pc);
 
+ private:
+  static PerfTickCounters* _perf_resolve_opt_virtual_total_time;
+  static PerfTickCounters* _perf_resolve_virtual_total_time;
+  static PerfTickCounters* _perf_resolve_static_total_time;
+  static PerfTickCounters* _perf_handle_wrong_method_total_time;
+  static PerfTickCounters* _perf_ic_miss_total_time;
+ public:
+  static uint _ic_miss_ctr;                      // total # of IC misses
+  static uint _wrong_method_ctr;
+  static uint _resolve_static_ctr;
+  static uint _resolve_virtual_ctr;
+  static uint _resolve_opt_virtual_ctr;
+
+  static void print_counters_on(outputStream* st);
+
 #ifndef PRODUCT
 
   // Collect and print inline cache miss statistics
@@ -524,11 +539,6 @@ class SharedRuntime: AllStatic {
   static void trace_ic_miss(address at);
 
  public:
-  static uint _ic_miss_ctr;                      // total # of IC misses
-  static uint _wrong_method_ctr;
-  static uint _resolve_static_ctr;
-  static uint _resolve_virtual_ctr;
-  static uint _resolve_opt_virtual_ctr;
   static uint _implicit_null_throws;
   static uint _implicit_div0_throws;
 
@@ -570,9 +580,9 @@ class SharedRuntime: AllStatic {
   static address nof_inlined_static_calls_addr()        { return (address)&_nof_inlined_static_calls; }
   static address nof_interface_calls_addr()             { return (address)&_nof_interface_calls; }
   static address nof_inlined_interface_calls_addr()     { return (address)&_nof_inlined_interface_calls; }
-  static void print_call_statistics(uint64_t comp_total);
-  static void print_ic_miss_histogram();
 
+  static void print_call_statistics_on(outputStream* st);
+  static void print_ic_miss_histogram_on(outputStream* st);
 #endif // PRODUCT
 
   static void print_statistics() PRODUCT_RETURN;
@@ -697,7 +707,7 @@ class AdapterHandlerLibrary: public AllStatic {
   static void print_handler_on(outputStream* st, const CodeBlob* b);
   static bool contains(const CodeBlob* b);
 #ifndef PRODUCT
-  static void print_statistics();
+  static void print_statistics_on(outputStream* st);
 #endif // PRODUCT
 
 };

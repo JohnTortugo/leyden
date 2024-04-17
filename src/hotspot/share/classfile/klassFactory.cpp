@@ -23,6 +23,7 @@
 */
 
 #include "precompiled.hpp"
+#include "cds/cds_globals.hpp"
 #include "cds/cdsConfig.hpp"
 #include "cds/filemap.hpp"
 #include "classfile/classFileParser.hpp"

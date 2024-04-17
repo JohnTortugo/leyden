@@ -108,7 +108,8 @@ class ConstantPool : public Metadata {
     _has_preresolution    = 1,       // Flags
     _on_stack             = 2,
     _is_shared            = 4,
-    _has_dynamic_constant = 8
+    _has_dynamic_constant = 8,
+    _is_for_method_handle_intrinsic = 16
   };
 
   u2              _flags;  // old fashioned bit twiddling
@@ -214,6 +215,9 @@ class ConstantPool : public Metadata {
 
   bool has_dynamic_constant() const       { return (_flags & _has_dynamic_constant) != 0; }
   void set_has_dynamic_constant()         { _flags |= _has_dynamic_constant; }
+
+  bool is_for_method_handle_intrinsic() const  { return (_flags & _is_for_method_handle_intrinsic) != 0; }
+  void set_is_for_method_handle_intrinsic()    { _flags |= _is_for_method_handle_intrinsic; }
 
   // Klass holding pool
   InstanceKlass* pool_holder() const      { return _pool_holder; }
@@ -669,7 +673,9 @@ class ConstantPool : public Metadata {
 
   int to_cp_index(int which, Bytecodes::Code code);
 
-  // Lookup for entries consisting of (name_index, signature_index)
+  bool is_resolved(int which, Bytecodes::Code code);
+
+    // Lookup for entries consisting of (name_index, signature_index)
   u2 name_ref_index_at(int cp_index);            // ==  low-order jshort of name_and_type_at(cp_index)
   u2 signature_ref_index_at(int cp_index);       // == high-order jshort of name_and_type_at(cp_index)
 
@@ -685,9 +691,16 @@ class ConstantPool : public Metadata {
   // CDS support
   objArrayOop prepare_resolved_references_for_archiving() NOT_CDS_JAVA_HEAP_RETURN_(nullptr);
   void add_dumped_interned_strings() NOT_CDS_JAVA_HEAP_RETURN;
-  bool maybe_archive_resolved_klass_at(int cp_index);
+  bool can_archive_invokehandle(ResolvedMethodEntry* rme);
+  bool can_archive_resolved_method(ResolvedMethodEntry* method_entry);
   void remove_unshareable_info();
+  void remove_unshareable_entries();
   void restore_unshareable_info(TRAPS);
+ private:
+  void remove_resolved_klass_if_non_deterministic(int cp_index);
+  void remove_resolved_field_entries_if_non_deterministic();
+  void remove_resolved_method_entries_if_non_deterministic();
+  void remove_resolved_indy_entries_if_non_deterministic();
 #endif
 
  private:

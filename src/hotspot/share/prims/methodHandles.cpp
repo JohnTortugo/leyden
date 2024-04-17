@@ -23,10 +23,12 @@
  */
 
 #include "precompiled.hpp"
+#include "cds/cds_globals.hpp"
 #include "classfile/javaClasses.inline.hpp"
 #include "classfile/stringTable.hpp"
 #include "classfile/symbolTable.hpp"
 #include "classfile/systemDictionary.hpp"
+#include "classfile/systemDictionaryShared.hpp"
 #include "classfile/vmClasses.hpp"
 #include "code/codeCache.hpp"
 #include "code/dependencyContext.hpp"
@@ -51,14 +53,17 @@
 #include "runtime/fieldDescriptor.inline.hpp"
 #include "runtime/handles.inline.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
+#include "runtime/java.hpp"
 #include "runtime/javaCalls.hpp"
 #include "runtime/jniHandles.inline.hpp"
+#include "runtime/perfData.inline.hpp"
 #include "runtime/timerTrace.hpp"
 #include "runtime/reflection.hpp"
 #include "runtime/safepointVerifiers.hpp"
 #include "runtime/signature.hpp"
 #include "runtime/stubRoutines.hpp"
 #include "sanitizers/leak.hpp"
+#include "services/management.hpp"
 #include "utilities/exceptions.hpp"
 
 
@@ -1046,7 +1051,7 @@ static bool advertise_con_value(int which) {
 #undef EACH_NAMED_CON
 #endif // PRODUCT
 
-JVM_ENTRY(jint, MHN_getNamedCon(JNIEnv *env, jobject igcls, jint which, jobjectArray box_jh)) {
+JVM_ENTRY_PROF(jint, MHN_getNamedCon, MHN_getNamedCon(JNIEnv *env, jobject igcls, jint which, jobjectArray box_jh)) {
 #ifndef PRODUCT
   if (advertise_con_value(which)) {
     assert(which >= 0 && which < con_value_count, "");
@@ -1067,7 +1072,7 @@ JVM_ENTRY(jint, MHN_getNamedCon(JNIEnv *env, jobject igcls, jint which, jobjectA
 JVM_END
 
 // void init(MemberName self, AccessibleObject ref)
-JVM_ENTRY(void, MHN_init_Mem(JNIEnv *env, jobject igcls, jobject mname_jh, jobject target_jh)) {
+JVM_ENTRY_PROF(void, MHN_init_Mem, MHN_init_Mem(JNIEnv *env, jobject igcls, jobject mname_jh, jobject target_jh)) {
   if (mname_jh == nullptr) { THROW_MSG(vmSymbols::java_lang_InternalError(), "mname is null"); }
   if (target_jh == nullptr) { THROW_MSG(vmSymbols::java_lang_InternalError(), "target is null"); }
   Handle mname(THREAD, JNIHandles::resolve_non_null(mname_jh));
@@ -1077,7 +1082,7 @@ JVM_ENTRY(void, MHN_init_Mem(JNIEnv *env, jobject igcls, jobject mname_jh, jobje
 JVM_END
 
 // void expand(MemberName self)
-JVM_ENTRY(void, MHN_expand_Mem(JNIEnv *env, jobject igcls, jobject mname_jh)) {
+JVM_ENTRY_PROF(void, MHN_expand_Mem, MHN_expand_Mem(JNIEnv *env, jobject igcls, jobject mname_jh)) {
   if (mname_jh == nullptr) { THROW_MSG(vmSymbols::java_lang_InternalError(), "mname is null"); }
   Handle mname(THREAD, JNIHandles::resolve_non_null(mname_jh));
   MethodHandles::expand_MemberName(mname, 0, CHECK);
@@ -1085,7 +1090,7 @@ JVM_ENTRY(void, MHN_expand_Mem(JNIEnv *env, jobject igcls, jobject mname_jh)) {
 JVM_END
 
 // void resolve(MemberName self, Class<?> caller)
-JVM_ENTRY(jobject, MHN_resolve_Mem(JNIEnv *env, jobject igcls, jobject mname_jh, jclass caller_jh,
+JVM_ENTRY_PROF(jobject, MHN_resolve_Mem, MHN_resolve_Mem(JNIEnv *env, jobject igcls, jobject mname_jh, jclass caller_jh,
     jint lookup_mode, jboolean speculative_resolve)) {
   if (mname_jh == nullptr) { THROW_MSG_NULL(vmSymbols::java_lang_InternalError(), "mname is null"); }
   Handle mname(THREAD, JNIHandles::resolve_non_null(mname_jh));
@@ -1171,17 +1176,17 @@ static jlong find_member_field_offset(oop mname, bool must_be_static, TRAPS) {
   return 0;
 }
 
-JVM_ENTRY(jlong, MHN_objectFieldOffset(JNIEnv *env, jobject igcls, jobject mname_jh)) {
+JVM_ENTRY_PROF(jlong, MHN_objectFieldOffset, MHN_objectFieldOffset(JNIEnv *env, jobject igcls, jobject mname_jh)) {
   return find_member_field_offset(JNIHandles::resolve(mname_jh), false, THREAD);
 }
 JVM_END
 
-JVM_ENTRY(jlong, MHN_staticFieldOffset(JNIEnv *env, jobject igcls, jobject mname_jh)) {
+JVM_ENTRY_PROF(jlong, MHN_staticFieldOffset, MHN_staticFieldOffset(JNIEnv *env, jobject igcls, jobject mname_jh)) {
   return find_member_field_offset(JNIHandles::resolve(mname_jh), true, THREAD);
 }
 JVM_END
 
-JVM_ENTRY(jobject, MHN_staticFieldBase(JNIEnv *env, jobject igcls, jobject mname_jh)) {
+JVM_ENTRY_PROF(jobject, MHN_staticFieldBase, MHN_staticFieldBase(JNIEnv *env, jobject igcls, jobject mname_jh)) {
   // use the other function to perform sanity checks:
   jlong ignore = find_member_field_offset(JNIHandles::resolve(mname_jh), true, CHECK_NULL);
   oop clazz = java_lang_invoke_MemberName::clazz(JNIHandles::resolve_non_null(mname_jh));
@@ -1189,7 +1194,7 @@ JVM_ENTRY(jobject, MHN_staticFieldBase(JNIEnv *env, jobject igcls, jobject mname
 }
 JVM_END
 
-JVM_ENTRY(jobject, MHN_getMemberVMInfo(JNIEnv *env, jobject igcls, jobject mname_jh)) {
+JVM_ENTRY_PROF(jobject, MHN_getMemberVMInfo, MHN_getMemberVMInfo(JNIEnv *env, jobject igcls, jobject mname_jh)) {
   if (mname_jh == nullptr)  return nullptr;
   Handle mname(THREAD, JNIHandles::resolve_non_null(mname_jh));
   intptr_t vmindex  = java_lang_invoke_MemberName::vmindex(mname());
@@ -1211,7 +1216,7 @@ JVM_ENTRY(jobject, MHN_getMemberVMInfo(JNIEnv *env, jobject igcls, jobject mname
 }
 JVM_END
 
-JVM_ENTRY(void, MHN_setCallSiteTargetNormal(JNIEnv* env, jobject igcls, jobject call_site_jh, jobject target_jh)) {
+JVM_ENTRY_PROF(void, MHN_setCallSiteTargetNormal, MHN_setCallSiteTargetNormal(JNIEnv* env, jobject igcls, jobject call_site_jh, jobject target_jh)) {
   Handle call_site(THREAD, JNIHandles::resolve_non_null(call_site_jh));
   Handle target   (THREAD, JNIHandles::resolve_non_null(target_jh));
   DeoptimizationScope deopt_scope;
@@ -1227,7 +1232,39 @@ JVM_ENTRY(void, MHN_setCallSiteTargetNormal(JNIEnv* env, jobject igcls, jobject 
 }
 JVM_END
 
-JVM_ENTRY(void, MHN_setCallSiteTargetVolatile(JNIEnv* env, jobject igcls, jobject call_site_jh, jobject target_jh)) {
+// Make sure the class is linked. If the class cannot be verified, etc, an exception will be thrown.
+JVM_ENTRY_PROF(void, MHN_checkArchivable, MHN_checkArchivable(JNIEnv *env, jobject igcls, jclass klass_jh)) {
+  if (klass_jh == nullptr) { THROW_MSG(vmSymbols::java_lang_InternalError(), "klass is null"); }
+
+  if (ArchiveInvokeDynamic) {
+    Klass* klass = java_lang_Class::as_Klass(JNIHandles::resolve_non_null(klass_jh));
+    if (klass != nullptr && klass->is_instance_klass()) {
+      // klass could be null during very early VM start-up
+      InstanceKlass* ik = InstanceKlass::cast(klass);
+      ik->link_class(THREAD); // exception will be thrown if unverifiable
+      if (!ik->is_linked()) {
+        assert(HAS_PENDING_EXCEPTION, "must be");
+        ResourceMark rm;
+        log_warning(cds)("Cannot use unverifiable class %s in MethodType",
+                         klass->external_name());
+        return;
+      }
+
+      if (SystemDictionaryShared::is_jfr_event_class(ik)) {
+        ResourceMark rm;
+        log_warning(cds)("Cannot use JFR event class %s in MethodType",
+                         klass->external_name());
+        Exceptions::fthrow(THREAD_AND_LOCATION,
+                           vmSymbols::java_lang_NoClassDefFoundError(),
+                           "Class %s, or one of its supertypes, is a JFR event class",
+                           klass->external_name());
+      }
+    }
+  }
+}
+JVM_END
+
+JVM_ENTRY_PROF(void, MHN_setCallSiteTargetVolatile, MHN_setCallSiteTargetVolatile(JNIEnv* env, jobject igcls, jobject call_site_jh, jobject target_jh)) {
   Handle call_site(THREAD, JNIHandles::resolve_non_null(call_site_jh));
   Handle target   (THREAD, JNIHandles::resolve_non_null(target_jh));
   DeoptimizationScope deopt_scope;
@@ -1243,7 +1280,7 @@ JVM_ENTRY(void, MHN_setCallSiteTargetVolatile(JNIEnv* env, jobject igcls, jobjec
 }
 JVM_END
 
-JVM_ENTRY(void, MHN_copyOutBootstrapArguments(JNIEnv* env, jobject igcls,
+JVM_ENTRY_PROF(void, MHN_copyOutBootstrapArguments, MHN_copyOutBootstrapArguments(JNIEnv* env, jobject igcls,
                                               jobject caller_jh, jintArray index_info_jh,
                                               jint start, jint end,
                                               jobjectArray buf_jh, jint pos,
@@ -1326,7 +1363,7 @@ JVM_END
 
 // It is called by a Cleaner object which ensures that dropped CallSites properly
 // deallocate their dependency information.
-JVM_ENTRY(void, MHN_clearCallSiteContext(JNIEnv* env, jobject igcls, jobject context_jh)) {
+JVM_ENTRY_PROF(void, MHN_clearCallSiteContext, MHN_clearCallSiteContext(JNIEnv* env, jobject igcls, jobject context_jh)) {
   Handle context(THREAD, JNIHandles::resolve_non_null(context_jh));
   DeoptimizationScope deopt_scope;
   {
@@ -1346,7 +1383,7 @@ JVM_END
  * This is required by the specification of MethodHandle.invoke if
  * invoked directly.
  */
-JVM_ENTRY(jobject, MH_invoke_UOE(JNIEnv* env, jobject mh, jobjectArray args)) {
+JVM_ENTRY_PROF(jobject, MH_invoke_UOE, MH_invoke_UOE(JNIEnv* env, jobject mh, jobjectArray args)) {
   THROW_MSG_NULL(vmSymbols::java_lang_UnsupportedOperationException(), "MethodHandle.invoke cannot be invoked reflectively");
   return nullptr;
 }
@@ -1357,7 +1394,7 @@ JVM_END
  * This is required by the specification of MethodHandle.invokeExact if
  * invoked directly.
  */
-JVM_ENTRY(jobject, MH_invokeExact_UOE(JNIEnv* env, jobject mh, jobjectArray args)) {
+JVM_ENTRY_PROF(jobject, MH_invokeExact_UOE, MH_invokeExact_UOE(JNIEnv* env, jobject mh, jobjectArray args)) {
   THROW_MSG_NULL(vmSymbols::java_lang_UnsupportedOperationException(), "MethodHandle.invokeExact cannot be invoked reflectively");
   return nullptr;
 }
@@ -1385,6 +1422,7 @@ static JNINativeMethod MHN_methods[] = {
   {CC "init",                      CC "(" MEM "" OBJ ")V",                   FN_PTR(MHN_init_Mem)},
   {CC "expand",                    CC "(" MEM ")V",                          FN_PTR(MHN_expand_Mem)},
   {CC "resolve",                   CC "(" MEM "" CLS "IZ)" MEM,              FN_PTR(MHN_resolve_Mem)},
+  {CC "checkArchivable",           CC "(" CLS ")V",                          FN_PTR(MHN_checkArchivable)},
   //  static native int getNamedCon(int which, Object[] name)
   {CC "getNamedCon",               CC "(I[" OBJ ")I",                        FN_PTR(MHN_getNamedCon)},
   {CC "objectFieldOffset",         CC "(" MEM ")J",                          FN_PTR(MHN_objectFieldOffset)},
@@ -1406,7 +1444,7 @@ static JNINativeMethod MH_methods[] = {
 /**
  * This one function is exported, used by NativeLookup.
  */
-JVM_ENTRY(void, JVM_RegisterMethodHandleMethods(JNIEnv *env, jclass MHN_class)) {
+JVM_ENTRY_PROF(void, JVM_RegisterMethodHandleMethods, JVM_RegisterMethodHandleMethods(JNIEnv *env, jclass MHN_class)) {
   assert(!MethodHandles::enabled(), "must not be enabled");
   assert(vmClasses::MethodHandle_klass() != nullptr, "should be present");
 
@@ -1430,3 +1468,58 @@ JVM_ENTRY(void, JVM_RegisterMethodHandleMethods(JNIEnv *env, jclass MHN_class)) 
   MethodHandles::set_enabled(true);
 }
 JVM_END
+
+#define DO_COUNTERS(macro)             \
+  macro(MHN_init_Mem)                  \
+  macro(MHN_expand_Mem)                \
+  macro(MHN_resolve_Mem)               \
+  macro(MHN_checkArchivable)           \
+  macro(MHN_getNamedCon)               \
+  macro(MHN_objectFieldOffset)         \
+  macro(MHN_setCallSiteTargetNormal)   \
+  macro(MHN_setCallSiteTargetVolatile) \
+  macro(MHN_copyOutBootstrapArguments) \
+  macro(MHN_clearCallSiteContext)      \
+  macro(MHN_staticFieldOffset)         \
+  macro(MHN_staticFieldBase)           \
+  macro(MHN_getMemberVMInfo)           \
+  macro(MH_invoke_UOE)                 \
+  macro(MH_invokeExact_UOE)            \
+  macro(JVM_RegisterMethodHandleMethods)
+
+#define INIT_COUNTER(name) \
+    NEWPERFTICKCOUNTERS(_perf_##name##_timer, SUN_RT, #name); \
+    NEWPERFEVENTCOUNTER(_perf_##name##_count, SUN_RT, #name "_count"); \
+
+void MethodHandles::init_counters() {
+  if (UsePerfData) {
+    EXCEPTION_MARK;
+
+    DO_COUNTERS(INIT_COUNTER)
+
+    if (HAS_PENDING_EXCEPTION) {
+      vm_exit_during_initialization("perf_mhn_init failed unexpectedly");
+    }
+  }
+}
+
+#undef INIT_COUNTER
+
+#define PRINT_COUNTER(name) {\
+  jlong count = _perf_##name##_count->get_value(); \
+  if (count > 0) { \
+    st->print_cr("  %-40s = %4ldms (elapsed) %4ldms (thread) (%5ld events)", #name, \
+                 _perf_##name##_timer->elapsed_counter_value_ms(), \
+                 _perf_##name##_timer->thread_counter_value_ms(), \
+                 count); \
+  }}
+
+void MethodHandles::print_counters_on(outputStream* st) {
+  if (ProfileVMCalls && UsePerfData) {
+    DO_COUNTERS(PRINT_COUNTER)
+  } else {
+    st->print_cr("  MHN:  no info (%s is disabled)", (UsePerfData ? "ProfileVMCalls" : "UsePerfData"));
+  }
+}
+
+#undef PRINT_COUNTER

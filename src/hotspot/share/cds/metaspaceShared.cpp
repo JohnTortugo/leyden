@@ -27,12 +27,14 @@
 #include "cds/archiveHeapLoader.hpp"
 #include "cds/archiveHeapWriter.hpp"
 #include "cds/cds_globals.hpp"
+#include "cds/cdsAccess.hpp"
 #include "cds/cdsConfig.hpp"
 #include "cds/cdsProtectionDomain.hpp"
 #include "cds/cds_globals.hpp"
 #include "cds/classListParser.hpp"
 #include "cds/classListWriter.hpp"
 #include "cds/classPrelinker.hpp"
+#include "cds/classPreloader.hpp"
 #include "cds/cppVtables.hpp"
 #include "cds/dumpAllocStats.hpp"
 #include "cds/dynamicArchive.hpp"
@@ -54,6 +56,9 @@
 #include "classfile/vmClasses.hpp"
 #include "classfile/vmSymbols.hpp"
 #include "code/codeCache.hpp"
+#include "code/SCCache.hpp"
+#include "compiler/compileBroker.hpp"
+#include "compiler/precompiler.hpp"
 #include "gc/shared/gcVMOperations.hpp"
 #include "interpreter/bytecodeStream.hpp"
 #include "interpreter/bytecodes.hpp"
@@ -69,14 +74,18 @@
 #include "oops/compressedKlass.hpp"
 #include "oops/instanceMirrorKlass.hpp"
 #include "oops/klass.inline.hpp"
+#include "oops/method.inline.hpp"
 #include "oops/objArrayOop.hpp"
 #include "oops/oop.inline.hpp"
 #include "oops/oopHandle.hpp"
+#include "oops/trainingData.hpp"
 #include "prims/jvmtiExport.hpp"
+#include "prims/whitebox.hpp"
 #include "runtime/arguments.hpp"
 #include "runtime/globals.hpp"
 #include "runtime/globals_extension.hpp"
 #include "runtime/handles.inline.hpp"
+#include "runtime/javaCalls.hpp"
 #include "runtime/os.inline.hpp"
 #include "runtime/safepointVerifiers.hpp"
 #include "runtime/sharedRuntime.hpp"
@@ -96,6 +105,7 @@ bool MetaspaceShared::_remapped_readwrite = false;
 void* MetaspaceShared::_shared_metaspace_static_top = nullptr;
 intx MetaspaceShared::_relocation_delta;
 char* MetaspaceShared::_requested_base_address;
+Array<Method*>* MetaspaceShared::_archived_method_handle_intrinsics = nullptr;
 bool MetaspaceShared::_use_optimized_module_handling = true;
 
 // The CDS archive is divided into the following regions:
@@ -299,6 +309,7 @@ void MetaspaceShared::post_initialize(TRAPS) {
 
 static GrowableArrayCHeap<OopHandle, mtClassShared>* _extra_interned_strings = nullptr;
 static GrowableArrayCHeap<Symbol*, mtClassShared>* _extra_symbols = nullptr;
+static GrowableArray<Method*>* _method_handle_intrinsics = nullptr;
 
 void MetaspaceShared::read_extra_data(JavaThread* current, const char* filename) {
   _extra_interned_strings = new GrowableArrayCHeap<OopHandle, mtClassShared>(10000);
@@ -349,6 +360,25 @@ void MetaspaceShared::read_extra_data(JavaThread* current, const char* filename)
   }
 }
 
+void MetaspaceShared::make_method_handle_intrinsics_shareable() {
+  for (int i = 0; i < _method_handle_intrinsics->length(); i++) {
+    Method* m = ArchiveBuilder::current()->get_buffered_addr(_method_handle_intrinsics->at(i));
+    m->remove_unshareable_info();
+    // Each method has its own constant pool (which is distinct from m->method_holder()->constants());
+    m->constants()->remove_unshareable_info();
+  }
+}
+
+void MetaspaceShared::write_method_handle_intrinsics() {
+  int len = _method_handle_intrinsics->length();
+  _archived_method_handle_intrinsics = ArchiveBuilder::new_ro_array<Method*>(len);
+  for (int i = 0; i < len; i++) {
+    ArchiveBuilder::current()->write_pointer_in_buffer(_archived_method_handle_intrinsics->adr_at(i),
+                                                       _method_handle_intrinsics->at(i));
+  }
+  log_info(cds)("Archived %d method handle intrinsics", len);
+}
+
 // Read/write a data stream for restoring/preserving metadata pointers and
 // miscellaneous data from/to the shared archive file.
 
@@ -373,6 +403,7 @@ void MetaspaceShared::serialize(SerializeClosure* soc) {
 
   // Dump/restore miscellaneous metadata.
   JavaClasses::serialize_offsets(soc);
+  HeapShared::serialize_misc_info(soc);
   Universe::serialize(soc);
   soc->do_tag(--tag);
 
@@ -385,7 +416,9 @@ void MetaspaceShared::serialize(SerializeClosure* soc) {
   StringTable::serialize_shared_table_header(soc);
   HeapShared::serialize_tables(soc);
   SystemDictionaryShared::serialize_dictionary_headers(soc);
-
+  ClassPreloader::serialize(soc, true);
+  ClassPrelinker::serialize(soc, true);
+  TrainingData::serialize_training_data(soc);
   InstanceMirrorKlass::serialize_offsets(soc);
 
   // Dump/restore well known classes (pointers)
@@ -394,6 +427,8 @@ void MetaspaceShared::serialize(SerializeClosure* soc) {
 
   CDS_JAVA_HEAP_ONLY(Modules::serialize(soc);)
   CDS_JAVA_HEAP_ONLY(ClassLoaderDataShared::serialize(soc);)
+  soc->do_ptr((void**)&_archived_method_handle_intrinsics);
+
 
   LambdaFormInvokers::serialize(soc);
   soc->do_tag(666);
@@ -436,23 +471,26 @@ void MetaspaceShared::rewrite_nofast_bytecodes_and_calculate_fingerprints(Thread
 class VM_PopulateDumpSharedSpace : public VM_Operation {
 private:
   ArchiveHeapInfo _heap_info;
-
   void dump_java_heap_objects(GrowableArray<Klass*>* klasses) NOT_CDS_JAVA_HEAP_RETURN;
   void dump_shared_symbol_table(GrowableArray<Symbol*>* symbols) {
     log_info(cds)("Dumping symbol table ...");
     SymbolTable::write_to_archive(symbols);
   }
   char* dump_read_only_tables();
-
+  StaticArchiveBuilder& _builder;
+  FileMapInfo* _mapinfo;
 public:
 
-  VM_PopulateDumpSharedSpace() : VM_Operation(), _heap_info() {}
+  VM_PopulateDumpSharedSpace(StaticArchiveBuilder& b) :
+    VM_Operation(), _heap_info(), _builder(b), _mapinfo(nullptr) {}
 
   bool skip_operation() const { return false; }
 
   VMOp_Type type() const { return VMOp_PopulateDumpSharedSpace; }
   void doit();   // outline because gdb sucks
   bool allow_nested_vm_operations() const { return true; }
+  FileMapInfo* mapinfo() const { return _mapinfo; }
+  ArchiveHeapInfo* heap_info() { return &_heap_info; }
 }; // class VM_PopulateDumpSharedSpace
 
 class StaticArchiveBuilder : public ArchiveBuilder {
@@ -464,6 +502,7 @@ public:
     SystemDictionaryShared::dumptime_classes_do(it);
     Universe::metaspace_pointers_do(it);
     vmSymbols::metaspace_pointers_do(it);
+    TrainingData::iterate_roots(it);
 
     // The above code should find all the symbols that are referenced by the
     // archived classes. We just need to add the extra symbols which
@@ -475,6 +514,10 @@ public:
         it->push(_extra_symbols->adr_at(i));
       }
     }
+
+    for (int i = 0; i < _method_handle_intrinsics->length(); i++) {
+      it->push(_method_handle_intrinsics->adr_at(i));
+    }
   }
 };
 
@@ -482,6 +525,10 @@ char* VM_PopulateDumpSharedSpace::dump_read_only_tables() {
   ArchiveBuilder::OtherROAllocMark mark;
 
   SystemDictionaryShared::write_to_archive();
+  ClassPreloader::record_initiated_klasses(true);
+  ClassPreloader::record_unregistered_klasses();
+  TrainingData::dump_training_data();
+  MetaspaceShared::write_method_handle_intrinsics();
 
   // Write lambform lines into archive
   LambdaFormInvokers::dump_static_archive_invokers();
@@ -507,55 +554,61 @@ void VM_PopulateDumpSharedSpace::doit() {
   MutexLocker ml(DumpTimeTable_lock, Mutex::_no_safepoint_check_flag);
   SystemDictionaryShared::check_excluded_classes();
 
-  StaticArchiveBuilder builder;
-  builder.gather_source_objs();
-  builder.reserve_buffer();
+  _builder.gather_source_objs();
+  _builder.reserve_buffer();
 
-  char* cloned_vtables = CppVtables::dumptime_init(&builder);
+  char* cloned_vtables = CppVtables::dumptime_init(&_builder);
 
   // Initialize random for updating the hash of symbols
   os::init_random(0x12345678);
 
-  builder.dump_rw_metadata();
-  builder.dump_ro_metadata();
-  builder.relocate_metaspaceobj_embedded_pointers();
+  _builder.dump_rw_metadata();
+  _builder.dump_ro_metadata();
+  _builder.relocate_metaspaceobj_embedded_pointers();
 
-  dump_java_heap_objects(builder.klasses());
-  dump_shared_symbol_table(builder.symbols());
+  dump_java_heap_objects(_builder.klasses());
+  dump_shared_symbol_table(_builder.symbols());
+
+  {
+    ArchiveBuilder::OtherROAllocMark mark;
+    ClassPreloader::record_preloaded_klasses(true);
+    if (CDSConfig::is_dumping_preimage_static_archive()) {
+      ClassPrelinker::record_final_image_eager_linkage();
+    }
+  }
 
   log_info(cds)("Make classes shareable");
-  builder.make_klasses_shareable();
+  _builder.make_klasses_shareable();
+  MetaspaceShared::make_method_handle_intrinsics_shareable();
 
   char* serialized_data = dump_read_only_tables();
 
   SystemDictionaryShared::adjust_lambda_proxy_class_dictionary();
 
+  log_info(cds)("Adjust method info dictionary");
+  SystemDictionaryShared::adjust_method_info_dictionary();
+
+  log_info(cds)("Adjust training data dictionary");
+  TrainingData::adjust_training_data_dictionary();
+
   // The vtable clones contain addresses of the current process.
   // We don't want to write these addresses into the archive.
   CppVtables::zero_archived_vtables();
 
-  // relocate the data so that it can be mapped to MetaspaceShared::requested_base_address()
-  // without runtime relocation.
-  builder.relocate_to_requested();
-
   // Write the archive file
-  const char* static_archive = CDSConfig::static_archive_path();
+  const char* static_archive;
+  if (CDSConfig::is_dumping_final_static_archive()) {
+    static_archive = CacheDataStore;
+    assert(FileMapInfo::current_info() != nullptr, "sanity");
+    delete FileMapInfo::current_info();
+  } else {
+    static_archive = CDSConfig::static_archive_path();
+  }
   assert(static_archive != nullptr, "SharedArchiveFile not set?");
-  FileMapInfo* mapinfo = new FileMapInfo(static_archive, true);
-  mapinfo->populate_header(MetaspaceShared::core_region_alignment());
-  mapinfo->set_serialized_data(serialized_data);
-  mapinfo->set_cloned_vtables(cloned_vtables);
-  mapinfo->open_for_write();
-  builder.write_archive(mapinfo, &_heap_info);
-
-  if (PrintSystemDictionaryAtExit) {
-    SystemDictionary::print();
-  }
-
-  if (AllowArchivingWithJavaAgent) {
-    log_warning(cds)("This archive was created with AllowArchivingWithJavaAgent. It should be used "
-            "for testing purposes only and should not be used in a production environment");
-  }
+  _mapinfo = new FileMapInfo(static_archive, true);
+  _mapinfo->populate_header(MetaspaceShared::core_region_alignment());
+  _mapinfo->set_serialized_data(serialized_data);
+  _mapinfo->set_cloned_vtables(cloned_vtables);
 }
 
 class CollectCLDClosure : public CLDClosure {
@@ -582,12 +635,16 @@ public:
 // Check if we can eagerly link this class at dump time, so we can avoid the
 // runtime linking overhead (especially verification)
 bool MetaspaceShared::may_be_eagerly_linked(InstanceKlass* ik) {
+  if (CDSConfig::preserve_all_dumptime_verification_states(ik)) {
+    assert(ik->can_be_verified_at_dumptime(), "sanity");
+  }
   if (!ik->can_be_verified_at_dumptime()) {
     // For old classes, try to leave them in the unlinked state, so
     // we can still store them in the archive. They must be
     // linked/verified at runtime.
     return false;
   }
+
   if (CDSConfig::is_dumping_dynamic_archive() && ik->is_shared_unregistered_class()) {
     // Linking of unregistered classes at this stage may cause more
     // classes to be resolved, resulting in calls to ClassLoader.loadClass()
@@ -600,19 +657,17 @@ bool MetaspaceShared::may_be_eagerly_linked(InstanceKlass* ik) {
   return true;
 }
 
-bool MetaspaceShared::link_class_for_cds(InstanceKlass* ik, TRAPS) {
-  // Link the class to cause the bytecodes to be rewritten and the
-  // cpcache to be created. Class verification is done according
-  // to -Xverify setting.
-  bool res = MetaspaceShared::try_link_class(THREAD, ik);
-  ClassPrelinker::dumptime_resolve_constants(ik, CHECK_(false));
-  return res;
-}
-
 void MetaspaceShared::link_shared_classes(bool jcmd_request, TRAPS) {
+  ClassPreloader::initialize();
   ClassPrelinker::initialize();
 
-  if (!jcmd_request) {
+  if (!jcmd_request && !CDSConfig::is_dumping_dynamic_archive()
+      && !CDSConfig::is_dumping_preimage_static_archive()
+      && !CDSConfig::is_dumping_final_static_archive()) {
+    // If we have regenerated invoker classes in the dynamic archive,
+    // they will conflict with the resolved CONSTANT_Klass references that are stored
+    // in the static archive. This is not easy to handle. Let's disable
+    // it for dynamic archive for now.
     LambdaFormInvokers::regenerate_holder_classes(CHECK);
   }
 
@@ -635,7 +690,10 @@ void MetaspaceShared::link_shared_classes(bool jcmd_request, TRAPS) {
         if (klass->is_instance_klass()) {
           InstanceKlass* ik = InstanceKlass::cast(klass);
           if (may_be_eagerly_linked(ik)) {
-            has_linked |= link_class_for_cds(ik, CHECK);
+            has_linked |= try_link_class(THREAD, ik);
+          }
+          if (CDSConfig::is_dumping_heap() && ik->is_linked() && !ik->is_initialized()) {
+            ClassPrelinker::maybe_preinit_class(ik, CHECK);
           }
         }
       }
@@ -646,6 +704,34 @@ void MetaspaceShared::link_shared_classes(bool jcmd_request, TRAPS) {
     }
     // Class linking includes verification which may load more classes.
     // Keep scanning until we have linked no more classes.
+  }
+
+  // Resolve constant pool entries -- we don't load any new classes during this stage
+  for (int i = 0; i < collect_cld.nof_cld(); i++) {
+    ClassLoaderData* cld = collect_cld.cld_at(i);
+    for (Klass* klass = cld->klasses(); klass != nullptr; klass = klass->next_link()) {
+      if (klass->is_instance_klass()) {
+        InstanceKlass* ik = InstanceKlass::cast(klass);
+        ClassPrelinker::dumptime_resolve_constants(ik, CHECK);
+        if (CDSConfig::is_dumping_preimage_static_archive()) {
+          ClassPrelinker::record_reflection_data_flags_for_preimage(ik, CHECK);
+        }
+      }
+    }
+  }
+
+  if (CDSConfig::is_dumping_preimage_static_archive()) {
+    // Do this after all classes are verified by the above loop.
+    // Any classes loaded from here on will be automatically excluded, so
+    // there's no need to force verification or resolve CP entries. 
+    RecordTraining = false;
+    SystemDictionaryShared::ignore_new_classes();
+    LambdaFormInvokers::regenerate_holder_classes(CHECK);
+    RecordTraining = true;
+  }
+
+  if (CDSConfig::is_dumping_final_static_archive()) {
+    ClassPrelinker::apply_final_image_eager_linkage(CHECK);
   }
 }
 
@@ -660,7 +746,15 @@ void MetaspaceShared::prepare_for_dumping() {
 void MetaspaceShared::preload_and_dump() {
   EXCEPTION_MARK;
   ResourceMark rm(THREAD);
-  preload_and_dump_impl(THREAD);
+  HandleMark hm(THREAD);
+
+  if (CDSConfig::is_dumping_final_static_archive() && PrintTrainingInfo) {
+    tty->print_cr("==================== archived_training_data ** before dumping ====================");
+    TrainingData::print_archived_training_data_on(tty);
+  }
+
+  StaticArchiveBuilder builder;
+  preload_and_dump_impl(builder, THREAD);
   if (HAS_PENDING_EXCEPTION) {
     if (PENDING_EXCEPTION->is_a(vmClasses::OutOfMemoryError_klass())) {
       log_error(cds)("Out of memory. Please run with a larger Java heap, current MaxHeapSize = "
@@ -761,24 +855,59 @@ void MetaspaceShared::preload_classes(TRAPS) {
   log_info(cds)("Shared spaces: preloaded %d classes", class_count);
 }
 
-void MetaspaceShared::preload_and_dump_impl(TRAPS) {
-  preload_classes(CHECK);
+void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS) {
+  if (CDSConfig::is_dumping_classic_static_archive()) {
+    // We are running with -Xshare:dump
+    preload_classes(CHECK);
 
-  if (SharedArchiveConfigFile) {
-    log_info(cds)("Reading extra data from %s ...", SharedArchiveConfigFile);
-    read_extra_data(THREAD, SharedArchiveConfigFile);
-    log_info(cds)("Reading extra data: done.");
+    if (SharedArchiveConfigFile) {
+      log_info(cds)("Reading extra data from %s ...", SharedArchiveConfigFile);
+      read_extra_data(THREAD, SharedArchiveConfigFile);
+      log_info(cds)("Reading extra data: done.");
+    }
   }
+
+  if (CDSConfig::is_dumping_preimage_static_archive()) {
+    log_info(cds)("Reading lambda form invokers of in JDK default classlist ...");
+    char default_classlist[JVM_MAXPATHLEN];
+    get_default_classlist(default_classlist, sizeof(default_classlist));
+    struct stat statbuf;
+    if (os::stat(default_classlist, &statbuf) == 0) {
+      ClassListParser::parse_classlist(default_classlist,
+                                       ClassListParser::_parse_lambda_forms_invokers_only, CHECK);
+    }
+  }
+
+#if INCLUDE_CDS_JAVA_HEAP
+  if (CDSConfig::is_dumping_heap() && ArchiveInvokeDynamic) {
+    // We also assume no other Java threads are running
+    // This makes sure that the MethodType and MethodTypeForm objects are clean.
+    JavaValue result(T_VOID);
+    JavaCalls::call_static(&result, vmClasses::MethodType_klass(),
+                           vmSymbols::dumpSharedArchive(),
+                           vmSymbols::void_method_signature(),
+                           CHECK);
+  }
+#endif
 
   // Rewrite and link classes
   log_info(cds)("Rewriting and linking classes ...");
-
   // Link any classes which got missed. This would happen if we have loaded classes that
   // were not explicitly specified in the classlist. E.g., if an interface implemented by class K
   // fails verification, all other interfaces that were not specified in the classlist but
   // are implemented by K are not verified.
   link_shared_classes(false/*not from jcmd*/, CHECK);
   log_info(cds)("Rewriting and linking classes: done");
+
+  if (CDSConfig::is_dumping_final_static_archive()) {
+    assert(RecordTraining == false, "must be");
+    RecordTraining = true;
+  }
+
+  TrainingData::init_dumptime_table(CHECK); // captures TrainingDataSetLocker
+
+  _method_handle_intrinsics = new (mtClassShared) GrowableArray<Method*>(256, mtClassShared);
+  SystemDictionary::get_all_method_handle_intrinsics(_method_handle_intrinsics);
 
 #if INCLUDE_CDS_JAVA_HEAP
   if (CDSConfig::is_dumping_heap()) {
@@ -792,14 +921,115 @@ void MetaspaceShared::preload_and_dump_impl(TRAPS) {
       HeapShared::reset_archived_object_states(CHECK);
     }
 
+    if (ArchiveLoaderLookupCache) {
+      SystemDictionaryShared::create_loader_positive_lookup_cache(CHECK);
+    }
+
     // Do this at the very end, when no Java code will be executed. Otherwise
     // some new strings may be added to the intern table.
     StringTable::allocate_shared_strings_array(CHECK);
   }
 #endif
 
-  VM_PopulateDumpSharedSpace op;
+  VM_PopulateDumpSharedSpace op(builder);
   VMThread::execute(&op);
+  FileMapInfo* mapinfo = op.mapinfo();
+  ArchiveHeapInfo* heap_info = op.heap_info();
+
+  if (CDSConfig::is_dumping_preimage_static_archive()) {
+    write_static_archive(&builder, mapinfo, heap_info);
+    fork_and_dump_final_static_archive();
+  } else if (CDSConfig::is_dumping_final_static_archive()) {
+    RecordTraining = false;
+    if (StoreCachedCode && CachedCodeFile != nullptr) { // FIXME: new workflow -- remove the CachedCodeFile flag
+      if (log_is_enabled(Info, cds, jit)) {
+        CDSAccess::test_heap_access_api();
+      }
+
+      // We have just created the final image. Let's run the AOT compiler
+      if (PrintTrainingInfo) {
+        tty->print_cr("==================== archived_training_data ** after dumping ====================");
+        TrainingData::print_archived_training_data_on(tty);
+      }
+
+      CDSConfig::enable_dumping_cached_code();
+      {
+        builder.start_cc_region();
+        Precompiler::compile_cached_code(&builder, CHECK);
+        builder.end_cc_region();
+      }
+      CDSConfig::disable_dumping_cached_code();
+
+      SCCache::close(); // Write final data and close archive
+    }
+    write_static_archive(&builder, mapinfo, heap_info);
+  } else {
+    write_static_archive(&builder, mapinfo, heap_info);
+  }
+}
+
+void MetaspaceShared::write_static_archive(ArchiveBuilder* builder, FileMapInfo *mapinfo, ArchiveHeapInfo* heap_info) {
+  // relocate the data so that it can be mapped to MetaspaceShared::requested_base_address()
+  // without runtime relocation.
+  builder->relocate_to_requested();
+
+  mapinfo->open_for_write();
+  builder->write_archive(mapinfo, heap_info);
+
+  if (PrintSystemDictionaryAtExit) {
+    SystemDictionary::print();
+  }
+
+  if (AllowArchivingWithJavaAgent) {
+    log_warning(cds)("This archive was created with AllowArchivingWithJavaAgent. It should be used "
+            "for testing purposes only and should not be used in a production environment");
+  }
+}
+
+void MetaspaceShared::fork_and_dump_final_static_archive() {
+  assert(CDSConfig::is_dumping_preimage_static_archive(), "sanity");
+
+  ResourceMark rm;
+  stringStream st;
+  st.print("%s%sbin%sjava", Arguments::get_java_home(), os::file_separator(), os::file_separator());
+  const char* cp = Arguments::get_appclasspath();
+  if (cp != nullptr && strlen(cp) > 0 && strcmp(cp, ".") != 0) {
+    st.print(" -cp ");  st.print_raw(cp);
+  }
+  for (int i = 0; i < Arguments::num_jvm_flags(); i++) {
+    st.print(" %s", Arguments::jvm_flags_array()[i]);
+  }
+  for (int i = 0; i < Arguments::num_jvm_args(); i++) {
+    st.print(" %s", Arguments::jvm_args_array()[i]);
+  }
+  st.print(" -XX:CDSPreimage=%s", SharedArchiveFile);
+
+  const char* cmd = st.freeze();
+  if (CDSManualFinalImage) {
+    tty->print_cr("-XX:+CDSManualFinalImage is specified");
+    tty->print_cr("Please manually execute the following command to create the final CDS image:");
+    tty->print("    "); tty->print_raw_cr(cmd);
+  } else {
+    log_info(cds)("Launching child process to create final CDS image:");
+    log_info(cds)("    %s", cmd);
+    int status = os::fork_and_exec(cmd);
+    if (status != 0) {
+      log_error(cds)("Child process finished; status = %d", status);
+      log_error(cds)("To reproduce the error");
+      ResourceMark rm;
+      LogStream ls(Log(cds)::error());
+      ls.print("    "); ls.print_raw_cr(cmd);
+      vm_direct_exit(status);
+    } else {
+      log_info(cds)("Child process finished; status = %d", status);
+      status = remove(SharedArchiveFile);
+      if (status != 0) {
+        log_error(cds)("Failed to remove CDSPreimage file %s", SharedArchiveFile);
+      } else {
+        log_info(cds)("Removed CDSPreimage file %s", SharedArchiveFile);
+      }
+    }
+  }
 }
 
 // Returns true if the class's status has changed.
@@ -807,7 +1037,13 @@ bool MetaspaceShared::try_link_class(JavaThread* current, InstanceKlass* ik) {
   ExceptionMark em(current);
   JavaThread* THREAD = current; // For exception macros.
   assert(CDSConfig::is_dumping_archive(), "sanity");
-  if (!ik->is_shared() && ik->is_loaded() && !ik->is_linked() && ik->can_be_verified_at_dumptime() &&
+
+  if (ik->is_shared() && !CDSConfig::is_dumping_final_static_archive()) {
+    assert(CDSConfig::is_dumping_dynamic_archive(), "must be");
+    return false;
+  }
+
+  if (ik->is_loaded() && !ik->is_linked() && ik->can_be_verified_at_dumptime() &&
       !SystemDictionaryShared::has_class_failed_verification(ik)) {
     bool saved = BytecodeVerificationLocal;
     if (ik->is_shared_unregistered_class() && ik->class_loader() == nullptr) {
@@ -839,11 +1075,13 @@ bool MetaspaceShared::try_link_class(JavaThread* current, InstanceKlass* ik) {
 #if INCLUDE_CDS_JAVA_HEAP
 void VM_PopulateDumpSharedSpace::dump_java_heap_objects(GrowableArray<Klass*>* klasses) {
   if(!HeapShared::can_write()) {
-    log_info(cds)(
+    if (!CDSConfig::is_dumping_preimage_static_archive()) {
+     log_info(cds)(
       "Archived java heap is not supported as UseG1GC "
       "and UseCompressedClassPointers are required."
       "Current settings: UseG1GC=%s, UseCompressedClassPointers=%s.",
       BOOL_TO_STR(UseG1GC), BOOL_TO_STR(UseCompressedClassPointers));
+    }
     return;
   }
   // Find all the interned strings that should be dumped.
@@ -920,7 +1158,7 @@ void MetaspaceShared::initialize_runtime_shared_and_meta_spaces() {
   assert(UseSharedSpaces, "Must be called when UseSharedSpaces is enabled");
   MapArchiveResult result = MAP_ARCHIVE_OTHER_FAILURE;
 
-  FileMapInfo* static_mapinfo = open_static_archive();
+  FileMapInfo* static_mapinfo = FileMapInfo::current_info();
   FileMapInfo* dynamic_mapinfo = nullptr;
 
   if (static_mapinfo != nullptr) {
@@ -967,6 +1205,10 @@ void MetaspaceShared::initialize_runtime_shared_and_meta_spaces() {
       MetaspaceShared::unrecoverable_loading_error("Unable to use shared archive.");
     } else if (RequireSharedSpaces) {
       MetaspaceShared::unrecoverable_loading_error("Unable to map shared spaces");
+    } else if (CDSConfig::is_dumping_final_static_archive()) {
+      assert(CDSPreimage != nullptr, "must be");
+      log_error(cds)("Unable to map shared spaces for CDSPreimage = %s", CDSPreimage);
+      MetaspaceShared::unrecoverable_loading_error();
     }
   }
 
@@ -981,19 +1223,26 @@ void MetaspaceShared::initialize_runtime_shared_and_meta_spaces() {
     delete dynamic_mapinfo;
   }
   if (RequireSharedSpaces && has_failed) {
+    // static archive mapped but dynamic archive failed
       MetaspaceShared::unrecoverable_loading_error("Unable to map shared spaces");
   }
 }
 
-FileMapInfo* MetaspaceShared::open_static_archive() {
+// This is called very early at VM start up to get the size of the cached_code region, which
+// is used in CodeCache::initialize_heaps()
+void MetaspaceShared::open_static_archive() {
+  if (!UseSharedSpaces) {
+    return;
+  }
   const char* static_archive = CDSConfig::static_archive_path();
   assert(static_archive != nullptr, "sanity");
   FileMapInfo* mapinfo = new FileMapInfo(static_archive, true);
   if (!mapinfo->initialize()) {
     delete(mapinfo);
-    return nullptr;
+  } else {
+    FileMapRegion* r = mapinfo->region_at(MetaspaceShared::cc);
+    CDSAccess::set_cached_code_size(r->used());
   }
-  return mapinfo;
 }
 
 FileMapInfo* MetaspaceShared::open_dynamic_archive() {
@@ -1467,6 +1716,7 @@ void MetaspaceShared::initialize_shared_spaces() {
   static_mapinfo->patch_heap_embedded_pointers();
   ArchiveHeapLoader::finish_initialization();
   Universe::load_archived_object_instances();
+  SCCache::new_workflow_load_cache();
 
   // Close the mapinfo file
   static_mapinfo->close();
@@ -1504,6 +1754,12 @@ void MetaspaceShared::initialize_shared_spaces() {
       tty->print_cr("\n\nDynamic archive name: %s", dynamic_mapinfo->full_path());
       tty->print_cr("Dynamic archive version %d", dynamic_mapinfo->version());
       SystemDictionaryShared::print_shared_archive(tty, false/*dynamic*/);
+    }
+    TrainingData::print_archived_training_data_on(tty);
+
+    if (LoadCachedCode) {
+      tty->print_cr("\n\nCached Code file: %s", CachedCodeFile);
+      SCCache::print_on(tty);
     }
 
     // collect shared symbols and strings

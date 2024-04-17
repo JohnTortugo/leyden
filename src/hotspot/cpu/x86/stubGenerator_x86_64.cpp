@@ -25,6 +25,7 @@
 #include "precompiled.hpp"
 #include "asm/macroAssembler.hpp"
 #include "classfile/vmIntrinsics.hpp"
+#include "code/SCCache.hpp"
 #include "compiler/oopMap.hpp"
 #include "gc/shared/barrierSet.hpp"
 #include "gc/shared/barrierSetAssembler.hpp"
@@ -3054,6 +3055,10 @@ address StubGenerator::generate_multiplyToLen() {
   StubCodeMark mark(this, "StubRoutines", "multiplyToLen");
   address start = __ pc();
 
+  if (SCCache::load_stub(this, vmIntrinsics::_multiplyToLen, "multiplyToLen", start)) {
+    return start;
+  }
+
   // Win64: rcx, rdx, r8, r9 (c_rarg0, c_rarg1, ...)
   // Unix:  rdi, rsi, rdx, rcx, r8, r9 (c_rarg0, c_rarg1, ...)
   const Register x     = rdi;
@@ -3094,6 +3099,7 @@ address StubGenerator::generate_multiplyToLen() {
   __ leave(); // required for proper stackwalking of RuntimeStub frame
   __ ret(0);
 
+  SCCache::store_stub(this, vmIntrinsics::_multiplyToLen, "multiplyToLen", start);
   return start;
 }
 
@@ -3165,6 +3171,10 @@ address StubGenerator::generate_squareToLen() {
   StubCodeMark mark(this, "StubRoutines", "squareToLen");
   address start = __ pc();
 
+  if (SCCache::load_stub(this, vmIntrinsics::_squareToLen, "squareToLen", start)) {
+    return start;
+  }
+
   // Win64: rcx, rdx, r8, r9 (c_rarg0, c_rarg1, ...)
   // Unix:  rdi, rsi, rdx, rcx (c_rarg0, c_rarg1, ...)
   const Register x      = rdi;
@@ -3192,6 +3202,7 @@ address StubGenerator::generate_squareToLen() {
   __ leave(); // required for proper stackwalking of RuntimeStub frame
   __ ret(0);
 
+  SCCache::store_stub(this, vmIntrinsics::_squareToLen, "squareToLen", start);
   return start;
 }
 
@@ -3289,6 +3300,10 @@ address StubGenerator::generate_mulAdd() {
   StubCodeMark mark(this, "StubRoutines", "mulAdd");
   address start = __ pc();
 
+  if (SCCache::load_stub(this, vmIntrinsics::_mulAdd, "mulAdd", start)) {
+    return start;
+  }
+
   // Win64: rcx, rdx, r8, r9 (c_rarg0, c_rarg1, ...)
   // Unix:  rdi, rsi, rdx, rcx, r8, r9 (c_rarg0, c_rarg1, ...)
   const Register out     = rdi;
@@ -3322,6 +3337,7 @@ address StubGenerator::generate_mulAdd() {
   __ leave(); // required for proper stackwalking of RuntimeStub frame
   __ ret(0);
 
+  SCCache::store_stub(this, vmIntrinsics::_mulAdd, "mulAdd", start);
   return start;
 }
 

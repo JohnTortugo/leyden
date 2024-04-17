@@ -23,7 +23,6 @@
  */
 
 #include "precompiled.hpp"
-#include "cds/archiveBuilder.hpp"
 #include "cds/cdsConfig.hpp"
 #include "cds/heapShared.hpp"
 #include "classfile/resolutionErrors.hpp"
@@ -173,7 +172,8 @@ void ConstantPoolCache::set_direct_or_vtable_call(Bytecodes::Code invoke_code,
     }
     if (invoke_code == Bytecodes::_invokestatic) {
       assert(method->method_holder()->is_initialized() ||
-             method->method_holder()->is_init_thread(JavaThread::current()),
+             method->method_holder()->is_init_thread(JavaThread::current()) ||
+             (CDSConfig::is_dumping_archive() && VM_Version::supports_fast_class_init_checks()),
              "invalid class initialization state for invoke_static");
 
       if (!VM_Version::supports_fast_class_init_checks() && method->needs_clinit_barrier()) {
@@ -360,6 +360,18 @@ Method* ConstantPoolCache::method_if_resolved(int method_index) const {
     }
   }
   return nullptr;
+#if 0
+ else {
+    assert(is_field_entry(), "must be a field entry");
+    st->print_cr(" - F1:  [   " PTR_FORMAT "]", (intptr_t)_f1);
+    st->print_cr(" - F2:  [   " PTR_FORMAT "]", (intptr_t)_f2);
+    st->print_cr(" - flag values: [%02x|0|1|0|0|0|%01x|%01x|0|0|%04x]",
+                 flag_state(), is_final(), is_volatile(), field_index());
+    st->print_cr(" - tos: %s\n - final: %d\n - volatile: %d\n - field index: %04x",
+                 type2name(as_BasicType(flag_state())), is_final(), is_volatile(), field_index());
+  }
+  st->print_cr("                 -------------");
+#endif
 }
 
 ConstantPoolCache* ConstantPoolCache::allocate(ClassLoaderData* loader_data,
@@ -384,30 +396,6 @@ ConstantPoolCache* ConstantPoolCache::allocate(ClassLoaderData* loader_data,
 void ConstantPoolCache::record_gc_epoch() {
   _gc_epoch = CodeCache::gc_epoch();
 }
-
-#if INCLUDE_CDS
-void ConstantPoolCache::remove_unshareable_info() {
-  assert(CDSConfig::is_dumping_archive(), "sanity");
-  // <this> is the copy to be written into the archive. It's in the ArchiveBuilder's "buffer space".
-  // However, this->_initial_entries was not copied/relocated by the ArchiveBuilder, so it's
-  // still pointing to the array allocated inside save_for_archive().
-  if (_resolved_indy_entries != nullptr) {
-    for (int i = 0; i < _resolved_indy_entries->length(); i++) {
-      resolved_indy_entry_at(i)->remove_unshareable_info();
-    }
-  }
-  if (_resolved_field_entries != nullptr) {
-    for (int i = 0; i < _resolved_field_entries->length(); i++) {
-      resolved_field_entry_at(i)->remove_unshareable_info();
-    }
-  }
-  if (_resolved_method_entries != nullptr) {
-    for (int i = 0; i < _resolved_method_entries->length(); i++) {
-      resolved_method_entry_at(i)->remove_unshareable_info();
-    }
-  }
-}
-#endif // INCLUDE_CDS
 
 void ConstantPoolCache::deallocate_contents(ClassLoaderData* data) {
   assert(!is_shared(), "shared caches are not deallocated");

@@ -2024,6 +2024,24 @@ void TemplateInterpreterGenerator::set_vtos_entry_points(Template* t,
 
 //-----------------------------------------------------------------------------
 
+void TemplateInterpreterGenerator::count_bytecode() {
+  if (CountBytecodesPerThread) {
+    Address bc_counter_addr(rthread, Thread::bc_counter_offset());
+    __ ldr(r10, bc_counter_addr);
+    __ add(r10, r10, 1);
+    __ str(r10, bc_counter_addr);
+  }
+  if (CountBytecodes || TraceBytecodes || StopInterpreterAt > 0) {
+    __ mov(r10, (address) &BytecodeCounter::_counter_value);
+    __ atomic_add(noreg, 1, r10);
+  }
+}
+
+void TemplateInterpreterGenerator::histogram_bytecode(Template* t) {
+  __ mov(r10, (address) &BytecodeHistogram::_counters[t->bytecode()]);
+  __ atomic_addw(noreg, 1, r10);
+}
+
 // Non-product code
 #ifndef PRODUCT
 address TemplateInterpreterGenerator::generate_trace_code(TosState state) {
@@ -2044,16 +2062,6 @@ address TemplateInterpreterGenerator::generate_trace_code(TosState state) {
   __ ret(lr);                                   // return from result handler
 
   return entry;
-}
-
-void TemplateInterpreterGenerator::count_bytecode() {
-  __ mov(r10, (address) &BytecodeCounter::_counter_value);
-  __ atomic_addw(noreg, 1, r10);
-}
-
-void TemplateInterpreterGenerator::histogram_bytecode(Template* t) {
-  __ mov(r10, (address) &BytecodeHistogram::_counters[t->bytecode()]);
-  __ atomic_addw(noreg, 1, r10);
 }
 
 void TemplateInterpreterGenerator::histogram_bytecode_pair(Template* t) {

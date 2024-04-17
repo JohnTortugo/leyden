@@ -319,6 +319,7 @@ class InstanceKlass: public Klass {
   void set_shared_loading_failed() { _misc_flags.set_shared_loading_failed(true); }
 
 #if INCLUDE_CDS
+  int  shared_class_loader_type() const;
   void set_shared_class_loader_type(s2 loader_type) { _misc_flags.set_shared_class_loader_type(loader_type); }
   void assign_class_loader_type() { _misc_flags.assign_class_loader_type(_class_loader_data); }
 #endif
@@ -517,6 +518,8 @@ public:
   const char* init_state_name() const;
   bool is_rewritten() const                { return _misc_flags.rewritten(); }
 
+  static const char* state2name(ClassState state);
+
   class LockLinkState : public StackObj {
     InstanceKlass* _ik;
     JavaThread*    _current;
@@ -545,6 +548,7 @@ public:
 
   // initialization (virtuals from Klass)
   bool should_be_initialized() const;  // means that initialize should be called
+  void initialize_from_cds(TRAPS);
   void initialize(TRAPS);
   void link_class(TRAPS);
   bool link_class_or_fail(TRAPS); // returns false on failure
@@ -816,7 +820,7 @@ public:
   }
   // allocation
   instanceOop allocate_instance(TRAPS);
-  static instanceOop allocate_instance(oop cls, TRAPS);
+  static instanceOop allocate_instance(oop cls, const char* who, TRAPS);
 
   // additional member function to return a handle
   instanceHandle allocate_instance_handle(TRAPS);
@@ -1091,7 +1095,7 @@ private:
   bool link_class_impl                           (TRAPS);
   bool verify_code                               (TRAPS);
   void initialize_impl                           (TRAPS);
-  void initialize_super_interfaces               (TRAPS);
+  void initialize_super_interfaces(TRAPS);
 
   void add_initialization_error(JavaThread* current, Handle exception);
   oop get_initialization_error(JavaThread* current);
@@ -1130,6 +1134,13 @@ public:
   bool methods_contain_jsr_bytecode() const;
   void compute_has_loops_flag_for_methods();
 #endif
+
+  bool     has_init_deps_processed() const { return _misc_flags.has_init_deps_processed(); }
+  void set_has_init_deps_processed() {
+    assert(is_initialized(), "");
+    assert(!has_init_deps_processed(), "already set"); // one-off action
+    _misc_flags.set_has_init_deps_processed(true);
+  }
 
   jint compute_modifier_flags() const;
 

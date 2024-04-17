@@ -26,6 +26,7 @@
 #include "cds/cds_globals.hpp"
 #include "cds/cdsConfig.hpp"
 #include "cds/filemap.hpp"
+#include "cds/heapShared.hpp"
 #include "classfile/classLoader.hpp"
 #include "classfile/javaAssertions.hpp"
 #include "classfile/moduleEntry.hpp"
@@ -1808,7 +1809,12 @@ bool Arguments::check_vm_args_consistency() {
   if (status && EnableJVMCI) {
     PropertyList_unique_add(&_system_properties, "jdk.internal.vm.ci.enabled", "true",
         AddProperty, UnwriteableProperty, InternalProperty);
-    if (ClassLoader::is_module_observable("jdk.internal.vm.ci")) {
+    /*
+     * Ioi - 2023/05/19. There's no need for this with my patch-jdk.sh script, which adds
+     * jdk.internal.vm.ci as one of the default modules. Using -Djdk.module.addmods will
+     * cause the full module graph to be disabled and slow down performance.
+     */
+    if (!TempDisableAddJVMCIModule && ClassLoader::is_module_observable("jdk.internal.vm.ci")) {
       if (!create_numbered_module_property("jdk.module.addmods", "jdk.internal.vm.ci", addmods_count++)) {
         return false;
       }
@@ -3739,6 +3745,31 @@ jint Arguments::apply_ergo() {
     FLAG_SET_DEFAULT(UseVectorStubs, false);
   }
 #endif // COMPILER2_OR_JVMCI
+
+  if (log_is_enabled(Info, init)) {
+    if (FLAG_IS_DEFAULT(ProfileVMLocks)) {
+      FLAG_SET_DEFAULT(ProfileVMLocks, true);
+    }
+    // Don't turn on ProfileVMCalls and ProfileRuntimeCalls by default.
+  } else {
+    if (!FLAG_IS_DEFAULT(ProfileVMLocks) && ProfileVMLocks) {
+      warning("Disabling ProfileVMLocks since logging is turned off.");
+      FLAG_SET_DEFAULT(ProfileVMLocks, false);
+    }
+    if (!FLAG_IS_DEFAULT(ProfileVMCalls) && ProfileVMCalls) {
+      warning("Disabling ProfileVMCalls since logging is turned off.");
+      FLAG_SET_DEFAULT(ProfileVMCalls, false);
+    }
+    if (!FLAG_IS_DEFAULT(ProfileRuntimeCalls) && ProfileRuntimeCalls) {
+      warning("Disabling ProfileRuntimeCalls since logging is turned off.");
+      FLAG_SET_DEFAULT(ProfileRuntimeCalls, false);
+    }
+  }
+  if (FLAG_IS_DEFAULT(PerfDataMemorySize)) {
+    if (ProfileVMLocks || ProfileVMCalls || ProfileRuntimeCalls) {
+      FLAG_SET_DEFAULT(PerfDataMemorySize, 128*K); // reserve more space for extra perf counters
+    }
+  }
 
   if (FLAG_IS_CMDLINE(DiagnoseSyncOnValueBasedClasses)) {
     if (DiagnoseSyncOnValueBasedClasses == ObjectSynchronizer::LOG_WARNING && !log_is_enabled(Info, valuebasedclasses)) {

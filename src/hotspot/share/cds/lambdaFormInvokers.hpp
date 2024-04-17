@@ -32,6 +32,7 @@
 class ClassFileStream;
 template <class T>
 class Array;
+class SerializeClosure;
 
 class LambdaFormInvokers : public AllStatic {
  private:
@@ -46,5 +47,6 @@ class LambdaFormInvokers : public AllStatic {
   static void regenerate_holder_classes(TRAPS);
   static void serialize(SerializeClosure* soc);
   static void cleanup_regenerated_classes();
+  inline static bool may_be_regenerated_class(Symbol* name);
 };
 #endif // SHARE_CDS_LAMBDAFORMINVOKERS_HPP

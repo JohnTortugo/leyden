@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1999, 2024, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2014, Red Hat Inc. All rights reserved.
  * Copyright (c) 2021, Azul Systems, Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
@@ -256,7 +256,7 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
         // here if the underlying file has been truncated.
         // Do not crash the VM in such a case.
         CodeBlob* cb = CodeCache::find_blob(pc);
-        CompiledMethod* nm = (cb != nullptr) ? cb->as_compiled_method_or_null() : nullptr;
+        nmethod* nm = (cb != nullptr) ? cb->as_nmethod_or_null() : nullptr;
         bool is_unsafe_arraycopy = (thread->doing_unsafe_access() && UnsafeCopyMemory::contains_pc(pc));
         if ((nm != nullptr && nm->has_unsafe_access()) || is_unsafe_arraycopy) {
           address next_pc = pc + NativeCall::instruction_size;
@@ -266,11 +266,8 @@ bool PosixSignals::pd_hotspot_signal_handler(int sig, siginfo_t* info,
           stub = SharedRuntime::handle_unsafe_access(thread, next_pc);
         }
       } else if (sig == SIGILL && nativeInstruction_at(pc)->is_stop()) {
-        // Pull a pointer to the error message out of the instruction
-        // stream.
-        const uint64_t *detail_msg_ptr
-          = (uint64_t*)(pc + NativeInstruction::instruction_size);
-        const char *detail_msg = (const char *)*detail_msg_ptr;
+        // A pointer to the message will have been placed in x0
+        const char *detail_msg = (const char *)(uc->uc_mcontext->DU3_PREFIX(ss,x[0]));
         const char *msg = "stop";
         if (TraceTraps) {
           tty->print_cr("trap: %s: (SIGILL)", msg);

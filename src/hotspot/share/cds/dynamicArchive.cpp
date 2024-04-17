@@ -29,8 +29,11 @@
 #include "cds/cds_globals.hpp"
 #include "cds/cdsConfig.hpp"
 #include "cds/classPrelinker.hpp"
+#include "cds/classPreloader.hpp"
 #include "cds/dynamicArchive.hpp"
+#include "cds/metaspaceShared.hpp"
 #include "cds/regeneratedClasses.hpp"
+#include "classfile/classLoader.hpp"
 #include "classfile/classLoaderData.inline.hpp"
 #include "classfile/symbolTable.hpp"
 #include "classfile/systemDictionaryShared.hpp"
@@ -118,6 +121,9 @@ public:
       return;
     }
 
+    log_info(cds,dynamic)("CDS dynamic dump: clinit = %ldms)",
+                          ClassLoader::class_init_time_ms());
+
     init_header();
     gather_source_objs();
     gather_array_klasses();
@@ -131,6 +137,16 @@ public:
 
     verify_estimate_size(_estimated_metaspaceobj_bytes, "MetaspaceObjs");
 
+    sort_methods();
+
+    {
+      ArchiveBuilder::OtherROAllocMark mark;
+      ClassPreloader::record_preloaded_klasses(false);
+    }
+
+    log_info(cds)("Make classes shareable");
+    make_klasses_shareable();
+
     char* serialized_data;
     {
       // Write the symbol table and system dictionaries to the RO space.
@@ -142,7 +158,10 @@ public:
 
       ArchiveBuilder::OtherROAllocMark mark;
       SystemDictionaryShared::write_to_archive(false);
+
       DynamicArchive::dump_array_klasses();
+      ClassPreloader::record_initiated_klasses(false);
+      TrainingData::dump_training_data();
 
       serialized_data = ro_region()->top();
       WriteClosure wc(ro_region());
@@ -151,13 +170,14 @@ public:
 
     verify_estimate_size(_estimated_hashtable_bytes, "Hashtables");
 
-    sort_methods();
-
-    log_info(cds)("Make classes shareable");
-    make_klasses_shareable();
-
     log_info(cds)("Adjust lambda proxy class dictionary");
     SystemDictionaryShared::adjust_lambda_proxy_class_dictionary();
+
+    log_info(cds)("Adjust method info dictionary");
+    SystemDictionaryShared::adjust_method_info_dictionary();
+
+    log_info(cds)("Adjust training data dictionary");
+    TrainingData::adjust_training_data_dictionary();
 
     relocate_to_requested();
 
@@ -174,6 +194,7 @@ public:
   virtual void iterate_roots(MetaspaceClosure* it) {
     FileMapInfo::metaspace_pointers_do(it);
     SystemDictionaryShared::dumptime_classes_do(it);
+    TrainingData::iterate_roots(it);
     iterate_primitive_array_klasses(it);
   }
 
@@ -230,6 +251,7 @@ void DynamicArchiveBuilder::release_header() {
 
 void DynamicArchiveBuilder::post_dump() {
   ArchivePtrMarker::reset_map_and_vs();
+  ClassPreloader::dispose();
   ClassPrelinker::dispose();
 }
 
@@ -501,9 +523,18 @@ void DynamicArchive::dump_at_exit(JavaThread* current, const char* archive_name)
   log_info(cds, dynamic)("Preparing for dynamic dump at exit in thread %s", current->name());
 
   JavaThread* THREAD = current; // For TRAPS processing related to link_shared_classes
+
+  {
+    // FIXME-HACK - make sure we have at least one class in the dynamic archive
+    TempNewSymbol class_name = SymbolTable::new_symbol("sun/nio/cs/IBM850"); // unusual class; shouldn't be used by our tests cases.
+    SystemDictionary::resolve_or_null(class_name, Handle(), Handle(), THREAD);
+    guarantee(!HAS_PENDING_EXCEPTION, "must have this class");
+  }
+
   MetaspaceShared::link_shared_classes(false/*not from jcmd*/, THREAD);
   if (!HAS_PENDING_EXCEPTION) {
     // copy shared path table to saved.
+    TrainingData::init_dumptime_table(CHECK); // captures TrainingDataSetLocker
     if (!HAS_PENDING_EXCEPTION) {
       VM_PopulateDynamicDumpSharedSpace op(archive_name);
       VMThread::execute(&op);
@@ -527,6 +558,7 @@ void DynamicArchive::dump_for_jcmd(const char* archive_name, TRAPS) {
   assert(CDSConfig::is_dumping_dynamic_archive(), "already checked by check_for_dynamic_dump() during VM startup");
   MetaspaceShared::link_shared_classes(true/*from jcmd*/, CHECK);
   // copy shared path table to saved.
+  TrainingData::init_dumptime_table(CHECK); // captures TrainingDataSetLocker
   VM_PopulateDynamicDumpSharedSpace op(archive_name);
   VMThread::execute(&op);
 }

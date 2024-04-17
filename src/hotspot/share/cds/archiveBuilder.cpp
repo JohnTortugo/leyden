@@ -27,12 +27,15 @@
 #include "cds/archiveHeapWriter.hpp"
 #include "cds/archiveUtils.hpp"
 #include "cds/cdsConfig.hpp"
+#include "cds/classPrelinker.hpp"
+#include "cds/classPreloader.hpp"
 #include "cds/cppVtables.hpp"
 #include "cds/dumpAllocStats.hpp"
 #include "cds/dynamicArchive.hpp"
 #include "cds/heapShared.hpp"
 #include "cds/metaspaceShared.hpp"
 #include "cds/regeneratedClasses.hpp"
+#include "classfile/classLoader.hpp"
 #include "classfile/classLoaderDataShared.hpp"
 #include "classfile/javaClasses.hpp"
 #include "classfile/symbolTable.hpp"
@@ -49,6 +52,7 @@
 #include "oops/objArrayKlass.hpp"
 #include "oops/objArrayOop.inline.hpp"
 #include "oops/oopHandle.inline.hpp"
+#include "oops/trainingData.hpp"
 #include "runtime/arguments.hpp"
 #include "runtime/fieldDescriptor.inline.hpp"
 #include "runtime/globals_extension.hpp"
@@ -157,6 +161,7 @@ ArchiveBuilder::ArchiveBuilder() :
   _buffer_to_requested_delta(0),
   _rw_region("rw", MAX_SHARED_DELTA),
   _ro_region("ro", MAX_SHARED_DELTA),
+  _cc_region("cc", MAX_SHARED_DELTA),
   _ptrmap(mtClassShared),
   _rw_src_objs(),
   _ro_src_objs(),
@@ -211,6 +216,9 @@ bool ArchiveBuilder::gather_klass_and_symbol(MetaspaceClosure::Ref* ref, bool re
     assert(klass->is_klass(), "must be");
     if (!is_excluded(klass)) {
       _klasses->append(klass);
+      if (klass->is_hidden() && klass->is_instance_klass()) {
+        update_hidden_class_loader_type(InstanceKlass::cast(klass));
+      }
     }
     // See RunTimeClassInfo::get_for()
     _estimated_metaspaceobj_bytes += align_up(BytesPerWord, SharedSpaceObjectAlignment);
@@ -269,6 +277,38 @@ void ArchiveBuilder::gather_klasses_and_symbols() {
   }
 }
 
+#if INCLUDE_CDS_JAVA_HEAP
+
+void ArchiveBuilder::update_hidden_class_loader_type(InstanceKlass* ik) {
+  s2 classloader_type;
+  if (HeapShared::is_lambda_form_klass(ik)) {
+    assert(CDSConfig::is_dumping_invokedynamic(), "lambda form classes are archived only if ArchiveInvokeDynamic is true");
+    classloader_type = ClassLoader::BOOT_LOADER;
+  } else if (HeapShared::is_lambda_proxy_klass(ik)) {
+    oop loader = ik->class_loader();
+
+    if (loader == nullptr) {
+      classloader_type = ClassLoader::BOOT_LOADER;
+    } else if (SystemDictionary::is_platform_class_loader(loader)) {
+      classloader_type = ClassLoader::PLATFORM_LOADER;
+    } else if (SystemDictionary::is_system_class_loader(loader)) {
+      classloader_type = ClassLoader::APP_LOADER;
+    } else {
+      ShouldNotReachHere();
+    }
+  } else {
+    ShouldNotReachHere();
+  }
+
+  ik->set_shared_class_loader_type(classloader_type);
+  if (HeapShared::is_lambda_proxy_klass(ik)) {
+    InstanceKlass* nest_host = ik->nest_host_not_null();
+    ik->set_shared_classpath_index(nest_host->shared_classpath_index());
+  }
+}
+
+#endif //INCLUDE_CDS_JAVA_HEAP
+
 int ArchiveBuilder::compare_symbols_by_address(Symbol** a, Symbol** b) {
   if (a[0] < b[0]) {
     return -1;
@@ -291,8 +331,17 @@ size_t ArchiveBuilder::estimate_archive_size() {
   // size of the symbol table and two dictionaries, plus the RunTimeClassInfo's
   size_t symbol_table_est = SymbolTable::estimate_size_for_archive();
   size_t dictionary_est = SystemDictionaryShared::estimate_size_for_archive();
-  _estimated_hashtable_bytes = symbol_table_est + dictionary_est;
+  size_t training_data_est = TrainingData::estimate_size_for_archive();
+  _estimated_hashtable_bytes = symbol_table_est + dictionary_est + training_data_est;
 
+  if (CDSConfig::is_dumping_final_static_archive()) {
+    _estimated_hashtable_bytes += 200 * 1024 * 1024; // FIXME -- need to iterate archived symbols??
+  }
+
+  if (CDSConfig::is_dumping_dynamic_archive()) {
+    // Some extra space for traning data. Be generous. Unused areas will be trimmed from the archive file.
+    _estimated_hashtable_bytes += 200 * 1024 * 1024;
+  }
   size_t total = 0;
 
   total += _estimated_metaspaceobj_bytes;
@@ -406,11 +455,12 @@ bool ArchiveBuilder::gather_one_source_obj(MetaspaceClosure::Ref* ref, bool read
   if (src_obj == nullptr) {
     return false;
   }
+
+  remember_embedded_pointer_in_enclosing_obj(ref);
   if (RegeneratedClasses::has_been_regenerated(src_obj)) {
     // No need to copy it. We will later relocate it to point to the regenerated klass/method.
     return false;
   }
-  remember_embedded_pointer_in_enclosing_obj(ref);
 
   FollowMode follow_mode = get_follow_mode(ref);
   SourceObjInfo src_info(ref, read_only, follow_mode);
@@ -510,7 +560,7 @@ bool ArchiveBuilder::is_excluded(Klass* klass) {
     return SystemDictionaryShared::is_excluded_class(ik);
   } else if (klass->is_objArray_klass()) {
     Klass* bottom = ObjArrayKlass::cast(klass)->bottom_klass();
-    if (MetaspaceShared::is_shared_static(bottom)) {
+    if (CDSConfig::is_dumping_dynamic_archive() && MetaspaceShared::is_shared_static(bottom)) {
       // The bottom class is in the static archive so it's clearly not excluded.
       assert(CDSConfig::is_dumping_dynamic_archive(), "sanity");
       return false;
@@ -524,12 +574,15 @@ bool ArchiveBuilder::is_excluded(Klass* klass) {
 
 ArchiveBuilder::FollowMode ArchiveBuilder::get_follow_mode(MetaspaceClosure::Ref *ref) {
   address obj = ref->obj();
-  if (MetaspaceShared::is_in_shared_metaspace(obj)) {
+  if (CDSConfig::is_dumping_dynamic_archive() && MetaspaceShared::is_in_shared_metaspace(obj)) {
     // Don't dump existing shared metadata again.
     return point_to_it;
   } else if (ref->msotype() == MetaspaceObj::MethodDataType ||
-             ref->msotype() == MetaspaceObj::MethodCountersType) {
-    return set_to_null;
+             ref->msotype() == MetaspaceObj::MethodCountersType ||
+             ref->msotype() == MetaspaceObj::KlassTrainingDataType ||
+             ref->msotype() == MetaspaceObj::MethodTrainingDataType ||
+             ref->msotype() == MetaspaceObj::CompileTrainingDataType) {
+      return TrainingData::need_data() ? make_a_copy : set_to_null;
   } else {
     if (ref->msotype() == MetaspaceObj::ClassType) {
       Klass* klass = (Klass*)ref->obj();
@@ -682,12 +735,25 @@ void ArchiveBuilder::write_pointer_in_buffer(address* ptr_location, address src_
   }
 }
 
+void ArchiveBuilder::mark_and_relocate_to_buffered_addr(address* ptr_location) {
+  assert(*ptr_location != nullptr, "sanity");
+  if (!is_in_mapped_static_archive(*ptr_location)) {
+    *ptr_location = get_buffered_addr(*ptr_location);
+  }
+  ArchivePtrMarker::mark_pointer(ptr_location);
+}
+
 address ArchiveBuilder::get_buffered_addr(address src_addr) const {
   SourceObjInfo* p = _src_obj_table.get(src_addr);
   assert(p != nullptr, "src_addr " INTPTR_FORMAT " is used but has not been archived",
          p2i(src_addr));
 
   return p->buffered_addr();
+}
+
+bool ArchiveBuilder::has_been_archived(address src_addr) const {
+  SourceObjInfo* p = _src_obj_table.get(src_addr);
+  return (p != nullptr);
 }
 
 address ArchiveBuilder::get_source_addr(address buffered_addr) const {
@@ -709,22 +775,50 @@ void ArchiveBuilder::relocate_metaspaceobj_embedded_pointers() {
   relocate_embedded_pointers(&_ro_src_objs);
 }
 
+#define ADD_COUNT(x) \
+  x += 1; \
+  x ## _p += preloaded; \
+  x ## _i += inited;
+
+#define DECLARE_INSTANCE_KLASS_COUNTER(x) \
+  int x = 0; \
+  int x ## _p = 0; \
+  int x ## _i = 0; \
+
 void ArchiveBuilder::make_klasses_shareable() {
-  int num_instance_klasses = 0;
-  int num_boot_klasses = 0;
-  int num_platform_klasses = 0;
-  int num_app_klasses = 0;
-  int num_hidden_klasses = 0;
-  int num_unlinked_klasses = 0;
-  int num_unregistered_klasses = 0;
+  DECLARE_INSTANCE_KLASS_COUNTER(num_instance_klasses);
+  DECLARE_INSTANCE_KLASS_COUNTER(num_boot_klasses);
+  DECLARE_INSTANCE_KLASS_COUNTER(num_vm_klasses);
+  DECLARE_INSTANCE_KLASS_COUNTER(num_platform_klasses);
+  DECLARE_INSTANCE_KLASS_COUNTER(num_app_klasses);
+  DECLARE_INSTANCE_KLASS_COUNTER(num_hidden_klasses);
+  DECLARE_INSTANCE_KLASS_COUNTER(num_unlinked_klasses);
+  DECLARE_INSTANCE_KLASS_COUNTER(num_unregistered_klasses);
   int num_obj_array_klasses = 0;
   int num_type_array_klasses = 0;
+
+  int boot_unlinked = 0;
+  int platform_unlinked = 0;
+  int app_unlinked = 0;
+  int unreg_unlinked = 0;
+
+  for (int i = 0; i < klasses()->length(); i++) {
+    // Some of the code in ConstantPool::remove_unshareable_info() requires the classes
+    // to be in linked state, so it must be call here before the next loop, which returns
+    // all classes to unlinked state.
+    Klass* k = get_buffered_addr(klasses()->at(i));
+    if (k->is_instance_klass()) {
+      InstanceKlass::cast(k)->constants()->remove_unshareable_info();
+    }
+  }
 
   for (int i = 0; i < klasses()->length(); i++) {
     const char* type;
     const char* unlinked = "";
     const char* hidden = "";
     const char* generated = "";
+    const char* preloaded_msg = "";
+    const char* inited_msg = "";
     Klass* k = get_buffered_addr(klasses()->at(i));
     k->remove_java_mirror();
     if (k->is_objArray_klass()) {
@@ -738,59 +832,111 @@ void ArchiveBuilder::make_klasses_shareable() {
       k->remove_unshareable_info();
     } else {
       assert(k->is_instance_klass(), " must be");
-      num_instance_klasses ++;
       InstanceKlass* ik = InstanceKlass::cast(k);
-      if (ik->is_shared_boot_class()) {
+      InstanceKlass* src_ik = get_source_addr(ik);
+      int preloaded = ClassPreloader::is_preloaded_class(src_ik);
+      int inited = ik->has_preinitialized_mirror();
+      ADD_COUNT(num_instance_klasses);
+      if (CDSConfig::is_dumping_dynamic_archive()) {
+        // For static dump, class loader type are already set.
+        ik->assign_class_loader_type();
+      }
+      if (ik->is_hidden()) {
+        oop loader = k->class_loader();
+        if (loader == nullptr) {
+          type = "boot";
+          ADD_COUNT(num_boot_klasses);
+        } else if (loader == SystemDictionary::java_platform_loader()) {
+          type = "plat";
+          ADD_COUNT(num_platform_klasses);
+        } else if (loader == SystemDictionary::java_system_loader()) {
+          type = "app";
+          ADD_COUNT(num_app_klasses);
+        } else {
+          type = "bad";
+          assert(0, "shouldn't happen");
+        }
+      } else if (ik->is_shared_boot_class()) {
         type = "boot";
-        num_boot_klasses ++;
+        ADD_COUNT(num_boot_klasses);
       } else if (ik->is_shared_platform_class()) {
         type = "plat";
-        num_platform_klasses ++;
+        ADD_COUNT(num_platform_klasses);
       } else if (ik->is_shared_app_class()) {
         type = "app";
-        num_app_klasses ++;
+        ADD_COUNT(num_app_klasses);
       } else {
         assert(ik->is_shared_unregistered_class(), "must be");
         type = "unreg";
-        num_unregistered_klasses ++;
+        ADD_COUNT(num_unregistered_klasses);
+      }
+
+      if (ClassPrelinker::is_vm_class(src_ik)) {
+        ADD_COUNT(num_vm_klasses);
       }
 
       if (!ik->is_linked()) {
-        num_unlinked_klasses ++;
-        unlinked = " ** unlinked";
+        ADD_COUNT(num_unlinked_klasses);
+        unlinked = " unlinked";
+        if (ik->is_shared_boot_class()) {
+          boot_unlinked ++;
+        } else if (ik->is_shared_platform_class()) {
+          platform_unlinked ++;
+        } else if (ik->is_shared_app_class()) {
+          app_unlinked ++;
+        } else {
+          unreg_unlinked ++;
+        }
       }
 
       if (ik->is_hidden()) {
-        num_hidden_klasses ++;
-        hidden = " ** hidden";
+        ADD_COUNT(num_hidden_klasses);
+        hidden = " hidden";
       }
 
       if (ik->is_generated_shared_class()) {
-        generated = " ** generated";
+        generated = " generated";
       }
+      if (preloaded) {
+        preloaded_msg = " preloaded";
+      }
+      if (inited) {
+        inited_msg = " inited";
+      }
+
       MetaspaceShared::rewrite_nofast_bytecodes_and_calculate_fingerprints(Thread::current(), ik);
       ik->remove_unshareable_info();
     }
 
     if (log_is_enabled(Debug, cds, class)) {
       ResourceMark rm;
-      log_debug(cds, class)("klasses[%5d] = " PTR_FORMAT " %-5s %s%s%s%s", i,
+      log_debug(cds, class)("klasses[%5d] = " PTR_FORMAT " %-5s %s%s%s%s%s%s", i,
                             p2i(to_requested(k)), type, k->external_name(),
-                            hidden, unlinked, generated);
+                            hidden, unlinked, generated, preloaded_msg, inited_msg);
     }
   }
 
+#define STATS_FORMAT    "= %5d, preloaded = %5d, inited = %5d"
+#define STATS_PARAMS(x) num_ ## x, num_ ## x ## _p, num_ ## x ## _i
+
   log_info(cds)("Number of classes %d", num_instance_klasses + num_obj_array_klasses + num_type_array_klasses);
-  log_info(cds)("    instance classes   = %5d", num_instance_klasses);
-  log_info(cds)("      boot             = %5d", num_boot_klasses);
-  log_info(cds)("      app              = %5d", num_app_klasses);
-  log_info(cds)("      platform         = %5d", num_platform_klasses);
-  log_info(cds)("      unregistered     = %5d", num_unregistered_klasses);
-  log_info(cds)("      (hidden)         = %5d", num_hidden_klasses);
-  log_info(cds)("      (unlinked)       = %5d", num_unlinked_klasses);
+  log_info(cds)("    instance classes   " STATS_FORMAT, STATS_PARAMS(instance_klasses));
+  log_info(cds)("      boot             " STATS_FORMAT, STATS_PARAMS(boot_klasses));
+  log_info(cds)("       vm              " STATS_FORMAT, STATS_PARAMS(vm_klasses));
+  log_info(cds)("      platform         " STATS_FORMAT, STATS_PARAMS(platform_klasses));
+  log_info(cds)("      app              " STATS_FORMAT, STATS_PARAMS(app_klasses));
+  log_info(cds)("      unregistered     " STATS_FORMAT, STATS_PARAMS(unregistered_klasses));
+  log_info(cds)("      (hidden)         " STATS_FORMAT, STATS_PARAMS(hidden_klasses));
+  log_info(cds)("      (unlinked)       " STATS_FORMAT ", boot = %d, plat = %d, app = %d, unreg = %d",
+                                                              STATS_PARAMS(unlinked_klasses),
+                                                              boot_unlinked, platform_unlinked,
+                                                              app_unlinked, unreg_unlinked);
   log_info(cds)("    obj array classes  = %5d", num_obj_array_klasses);
   log_info(cds)("    type array classes = %5d", num_type_array_klasses);
   log_info(cds)("               symbols = %5d", _symbols->length());
+
+#undef STATS_FORMAT
+#undef STATS_PARAMS
 
   DynamicArchive::make_array_klasses_shareable();
 }
@@ -799,6 +945,9 @@ void ArchiveBuilder::serialize_dynamic_archivable_items(SerializeClosure* soc) {
   SymbolTable::serialize_shared_table_header(soc, false);
   SystemDictionaryShared::serialize_dictionary_headers(soc, false);
   DynamicArchive::serialize_array_klasses(soc);
+  ClassPreloader::serialize(soc, false);
+  ClassPrelinker::serialize(soc, false);
+  TrainingData::serialize_training_data(soc);
 }
 
 uintx ArchiveBuilder::buffer_to_offset(address p) const {
@@ -817,6 +966,15 @@ uintx ArchiveBuilder::any_to_offset(address p) const {
     p = get_buffered_addr(p);
   }
   return buffer_to_offset(p);
+}
+
+void ArchiveBuilder::start_cc_region() {
+  ro_region()->pack();
+  start_dump_space(&_cc_region);
+}
+
+void ArchiveBuilder::end_cc_region() {
+  _cc_region.pack();
 }
 
 #if INCLUDE_CDS_JAVA_HEAP
@@ -908,7 +1066,9 @@ class RelocateBufferToRequested : public BitMapClosure {
 
 
 void ArchiveBuilder::relocate_to_requested() {
-  ro_region()->pack();
+  if (!ro_region()->is_packed()) {
+    ro_region()->pack();
+  }
 
   size_t my_archive_size = buffer_top() - buffer_bottom();
 
@@ -1056,6 +1216,8 @@ class ArchiveBuilder::CDSMapLogger : AllStatic {
       oop source_oop = ArchiveHeapWriter::buffered_addr_to_source_obj(start);
       address requested_start = ArchiveHeapWriter::buffered_addr_to_requested_addr(start);
       st.print(PTR_FORMAT ": @@ Object ", p2i(requested_start));
+      int permobj_segment = -1;
+      int permobj_segment_length = -1;
 
       if (source_oop != nullptr) {
         // This is a regular oop that got archived.
@@ -1070,6 +1232,8 @@ class ArchiveBuilder::CDSMapLogger : AllStatic {
       } else if ((byte_size = ArchiveHeapWriter::get_filler_size_at(start)) > 0) {
         // We have a filler oop, which also does not exist in BufferOffsetToSourceObjectTable.
         st.print_cr("filler " SIZE_FORMAT " bytes", byte_size);
+      } else if ((permobj_segment = ArchiveHeapWriter::get_permobj_segment_at(start, &byte_size, &permobj_segment_length)) >= 0) {
+        st.print_cr("permobj_%d[%d] %zu bytes", permobj_segment, permobj_segment_length, byte_size);
       } else {
         ShouldNotReachHere();
       }
@@ -1081,6 +1245,8 @@ class ArchiveBuilder::CDSMapLogger : AllStatic {
         log_oop_details(heap_info, source_oop, /*buffered_addr=*/start);
       } else if (start == ArchiveHeapWriter::buffered_heap_roots_addr()) {
         log_heap_roots();
+      } else if (permobj_segment >= 0) {
+        log_permobj_segment(permobj_segment, permobj_segment_length);
       }
       start = oop_end;
     }
@@ -1181,6 +1347,17 @@ class ArchiveBuilder::CDSMapLogger : AllStatic {
     }
   }
 
+  static void log_permobj_segment(int permobj_segment, int permobj_segment_length) {
+    LogStreamHandle(Trace, cds, map, oops) st;
+    if (st.is_enabled()) {
+      for (int i = 0; i < permobj_segment_length; i++) {
+        st.print("permobj_%d[%4d]: ", permobj_segment, i);
+        print_oop_with_requested_addr_cr(&st, ArchiveHeapWriter::get_permobj_source_addr(permobj_segment, i));
+      }
+    }
+  }
+
+
   // The output looks like this. The first number is the requested address. The second number is
   // the narrowOop version of the requested address.
   //     0x00000007ffc7e840 (0xfff8fd08) java.lang.Class
@@ -1201,7 +1378,12 @@ class ArchiveBuilder::CDSMapLogger : AllStatic {
         int array_len = arrayOop(source_oop)->length();
         st->print_cr("%s length: %d", source_oop->klass()->external_name(), array_len);
       } else {
-        st->print_cr("%s", source_oop->klass()->external_name());
+        st->print("%s", source_oop->klass()->external_name());
+        if (java_lang_invoke_MethodType::is_instance(source_oop)) {
+          st->print(" ");
+          java_lang_invoke_MethodType::print_signature(source_oop, st);
+        }
+        st->cr();
       }
     }
   }
@@ -1274,6 +1456,7 @@ void ArchiveBuilder::write_archive(FileMapInfo* mapinfo, ArchiveHeapInfo* heap_i
 
   write_region(mapinfo, MetaspaceShared::rw, &_rw_region, /*read_only=*/false,/*allow_exec=*/false);
   write_region(mapinfo, MetaspaceShared::ro, &_ro_region, /*read_only=*/true, /*allow_exec=*/false);
+  write_region(mapinfo, MetaspaceShared::cc, &_cc_region, /*read_only=*/false,/*allow_exec=*/true);
 
   size_t bitmap_size_in_bytes;
   char* bitmap = mapinfo->write_bitmap_region(ArchivePtrMarker::ptrmap(), heap_info,
@@ -1322,6 +1505,7 @@ void ArchiveBuilder::print_region_stats(FileMapInfo *mapinfo, ArchiveHeapInfo* h
 
   _rw_region.print(total_reserved);
   _ro_region.print(total_reserved);
+  _cc_region.print(total_reserved);
 
   print_bitmap_region_stats(bitmap_used, total_reserved);
 
@@ -1356,10 +1540,3 @@ void ArchiveBuilder::report_out_of_space(const char* name, size_t needed_bytes) 
   log_error(cds)("Unable to allocate from '%s' region: Please reduce the number of shared classes.", name);
   MetaspaceShared::unrecoverable_writing_error();
 }
-
-
-#ifndef PRODUCT
-void ArchiveBuilder::assert_is_vm_thread() {
-  assert(Thread::current()->is_VM_thread(), "ArchiveBuilder should be used only inside the VMThread");
-}
-#endif

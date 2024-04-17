@@ -213,7 +213,10 @@ void FileMapHeader::populate(FileMapInfo *info, size_t core_region_alignment,
   _compressed_class_ptrs = UseCompressedClassPointers;
   _max_heap_size = MaxHeapSize;
   _use_optimized_module_handling = CDSConfig::is_using_optimized_module_handling();
+  _has_preloaded_classes = PreloadSharedClasses;
   _has_full_module_graph = CDSConfig::is_dumping_full_module_graph();
+  _has_archived_invokedynamic = CDSConfig::is_dumping_invokedynamic();
+  _has_archived_packages = CDSConfig::is_dumping_packages();
 
   // The following fields are for sanity checks for whether this archive
   // will function correctly with this JVM and the bootclasspath it's
@@ -294,6 +297,8 @@ void FileMapHeader::print(outputStream* st) {
   st->print_cr("- allow_archiving_with_java_agent:%d", _allow_archiving_with_java_agent);
   st->print_cr("- use_optimized_module_handling:  %d", _use_optimized_module_handling);
   st->print_cr("- has_full_module_graph           %d", _has_full_module_graph);
+  st->print_cr("- has_archived_invokedynamic      %d", _has_archived_invokedynamic);
+  st->print_cr("- has_archived_packages           %d", _has_archived_packages);
   st->print_cr("- ptrmap_size_in_bits:            " SIZE_FORMAT, _ptrmap_size_in_bits);
 }
 
@@ -559,6 +564,9 @@ int FileMapInfo::num_non_existent_class_paths() {
 }
 
 int FileMapInfo::get_module_shared_path_index(Symbol* location) {
+  if (location == nullptr) {
+    return 0; // Used by java/lang/reflect/Proxy$ProxyBuilder
+  }
   if (location->starts_with("jrt:", 4) && get_number_of_shared_paths() > 0) {
     assert(shared_path(0)->is_modules_image(), "first shared_path must be the modules image");
     return 0;
@@ -1489,7 +1497,7 @@ bool FileMapRegion::check_region_crc(char* base) const {
 
 static const char* region_name(int region_index) {
   static const char* names[] = {
-    "rw", "ro", "bm", "hp"
+    "rw", "ro", "bm", "hp", "cc",
   };
   const int num_regions = sizeof(names)/sizeof(names[0]);
   assert(0 <= region_index && region_index < num_regions, "sanity");
@@ -1552,6 +1560,9 @@ void FileMapInfo::write_region(int region, char* base, size_t size,
                    " bytes, addr " INTPTR_FORMAT " file offset 0x%08" PRIxPTR
                    " crc 0x%08x",
                    region_name(region), region, size, p2i(requested_base), _file_offset, crc);
+  } else {
+    log_info(cds)("Shared file region (%s) %d: " SIZE_FORMAT_W(8)
+                  " bytes", region_name(region), region, size);
   }
 
   r->init(region, mapping_offset, size, read_only, allow_exec, crc);
@@ -1739,7 +1750,7 @@ bool FileMapInfo::remap_shared_readonly_as_readwrite() {
 }
 
 // Memory map a region in the address space.
-static const char* shared_region_name[] = { "ReadWrite", "ReadOnly", "Bitmap", "Heap" };
+static const char* shared_region_name[] = { "ReadWrite", "ReadOnly", "Bitmap", "Heap", "Code" };
 
 MapArchiveResult FileMapInfo::map_regions(int regions[], int num_regions, char* mapped_base_address, ReservedSpace rs) {
   DEBUG_ONLY(FileMapRegion* last_region = nullptr);
@@ -1842,8 +1853,9 @@ MapArchiveResult FileMapInfo::map_region(int i, intx addr_delta, char* mapped_ba
     // Note that this may either be a "fresh" mapping into unreserved address
     // space (Windows, first mapping attempt), or a mapping into pre-reserved
     // space (Posix). See also comment in MetaspaceShared::map_archives().
+    bool read_only = r->read_only() && !CDSConfig::is_dumping_final_static_archive();
     char* base = map_memory(_fd, _full_path, r->file_offset(),
-                            requested_addr, size, r->read_only(),
+                            requested_addr, size, read_only,
                             r->allow_exec(), mtClassShared);
     if (base != requested_addr) {
       log_info(cds)("Unable to map %s shared space at " INTPTR_FORMAT,
@@ -1895,6 +1907,86 @@ char* FileMapInfo::map_bitmap_region() {
   return bitmap_base;
 }
 
+bool FileMapInfo::map_cached_code_region(ReservedSpace rs) {
+  FileMapRegion* r = region_at(MetaspaceShared::cc);
+  assert(r->used() > 0 && rs.size(), "must be");
+
+  bool read_only = false, allow_exec = true;
+  char* requested_base = rs.base();
+  char* mapped_base = map_memory(_fd, _full_path, r->file_offset(),
+                                 requested_base, r->used_aligned(), read_only, allow_exec, mtClassShared);
+  if (mapped_base == nullptr) {
+    log_info(cds)("failed to map cached code region");
+    return false;
+  } else {
+    assert(mapped_base == requested_base, "must be");
+    r->set_mapped_from_file(true);
+    r->set_mapped_base(mapped_base);
+    relocate_pointers_in_cached_code_region();
+    log_info(cds)("Mapped static region #%d at base " INTPTR_FORMAT " top " INTPTR_FORMAT " (%s)",
+                  MetaspaceShared::bm, p2i(r->mapped_base()), p2i(r->mapped_end()),
+                  shared_region_name[MetaspaceShared::cc]);
+    return true;
+  }
+}
+
+class CachedCodeRelocator: public BitMapClosure {
+  address _code_requested_base;
+  address* _patch_base;
+  intx _code_delta;
+  intx _metadata_delta;
+
+public:
+  CachedCodeRelocator(address code_requested_base, address code_mapped_base,
+                      intx metadata_delta) {
+    _code_requested_base = code_requested_base;
+    _patch_base = (address*)code_mapped_base;
+    _code_delta = code_mapped_base - code_requested_base;
+    _metadata_delta = metadata_delta;
+  }
+  
+  bool do_bit(size_t offset) {
+    address* p = _patch_base + offset;
+    address requested_ptr = *p;
+    if (requested_ptr < _code_requested_base) {
+      *p = requested_ptr + _metadata_delta;
+    } else {
+      *p = requested_ptr + _code_delta;
+    }
+    return true; // keep iterating
+  }
+};
+
+void FileMapInfo::relocate_pointers_in_cached_code_region() {
+  FileMapRegion* r = region_at(MetaspaceShared::cc);
+  char* bitmap_base = map_bitmap_region();
+
+  address core_regions_requested_base = (address)header()->requested_base_address();
+  address core_regions_mapped_base = (address)header()->mapped_base_address();
+  address cc_region_requested_base = core_regions_requested_base + r->mapping_offset();
+  address cc_region_mapped_base = (address)r->mapped_base();
+
+  size_t max_bits_for_core_regions = pointer_delta(mapped_end(), mapped_base(), // FIXME - renamed to core_regions_mapped_base(), etc
+                                                   sizeof(address));
+  size_t ptrmap_size_in_bits = header()->ptrmap_size_in_bits();
+  if (ptrmap_size_in_bits <= max_bits_for_core_regions) {
+    // No relocation inside the cached code region??
+    return;
+  }
+
+  ptrmap_size_in_bits -= max_bits_for_core_regions;
+  assert((max_bits_for_core_regions % 8) == 0, "must be aligned");
+  bitmap_base += max_bits_for_core_regions / 8;
+  BitMapView ptrmap((BitMap::bm_word_t*)bitmap_base, ptrmap_size_in_bits);
+
+  log_debug(cds, reloc)("cached code bitmap @ " INTPTR_FORMAT " (" SIZE_FORMAT " bits)",
+                        p2i(bitmap_base), ptrmap_size_in_bits);
+
+  CachedCodeRelocator patcher(cc_region_requested_base, cc_region_mapped_base,
+                              core_regions_mapped_base - core_regions_requested_base);
+  ptrmap.iterate(&patcher);
+}
+
 // This is called when we cannot map the archive at the requested[ base address (usually 0x800000000).
 // We relocate all pointers in the 2 core regions (ro, rw).
 bool FileMapInfo::relocate_pointers_in_core_regions(intx addr_delta) {
@@ -1904,15 +1996,13 @@ bool FileMapInfo::relocate_pointers_in_core_regions(intx addr_delta) {
   if (bitmap_base == nullptr) {
     return false; // OOM, or CRC check failure
   } else {
-    size_t ptrmap_size_in_bits = header()->ptrmap_size_in_bits();
-    log_debug(cds, reloc)("mapped relocation bitmap @ " INTPTR_FORMAT " (" SIZE_FORMAT " bits)",
-                          p2i(bitmap_base), ptrmap_size_in_bits);
-
-    BitMapView ptrmap((BitMap::bm_word_t*)bitmap_base, ptrmap_size_in_bits);
-
     // Patch all pointers in the mapped region that are marked by ptrmap.
     address patch_base = (address)mapped_base();
     address patch_end  = (address)mapped_end();
+
+    // Exclude the bits used for the code_cache region (if it exists)
+    size_t max_bits_for_core_regions = pointer_delta(patch_end, patch_base, sizeof(address));
+    size_t ptrmap_size_in_bits = MIN2(header()->ptrmap_size_in_bits(), max_bits_for_core_regions);
 
     // the current value of the pointers to be patched must be within this
     // range (i.e., must be between the requested base address and the address of the current archive).
@@ -1924,6 +2014,10 @@ bool FileMapInfo::relocate_pointers_in_core_regions(intx addr_delta) {
     // (the requested location of the archive, as mapped at runtime).
     address valid_new_base = (address)header()->mapped_base_address();
     address valid_new_end  = (address)mapped_end();
+
+    log_debug(cds, reloc)("mapped relocation bitmap @ " INTPTR_FORMAT " (" SIZE_FORMAT " bits)",
+                          p2i(bitmap_base), ptrmap_size_in_bits);
+    BitMapView ptrmap((BitMap::bm_word_t*)bitmap_base, ptrmap_size_in_bits);
 
     SharedDataRelocator patcher((address*)patch_base, (address*)patch_end, valid_old_base, valid_old_end,
                                 valid_new_base, valid_new_end, addr_delta);
@@ -2005,7 +2099,7 @@ void FileMapInfo::map_or_load_heap_region() {
   }
 
   if (!success) {
-    CDSConfig::stop_using_full_module_graph();
+    CDSConfig::stop_using_full_module_graph("archive heap loading failed");
   }
 }
 
@@ -2317,6 +2411,17 @@ bool FileMapInfo::initialize() {
     }
   }
 
+  if (header()->has_preloaded_classes()) {
+    if (JvmtiExport::should_post_class_file_load_hook()) {
+      log_info(cds)("CDS archive has preloaded classes. It cannot be used when JVMTI ClassFileLoadHook is in use.");
+      return false;
+    }
+    if (JvmtiExport::has_early_vmstart_env()) {
+      log_info(cds)("CDS archive has preloaded classes. It cannot be used when JVMTI early vm start is in use.");
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -2425,9 +2530,18 @@ bool FileMapHeader::validate() {
     log_info(cds)("optimized module handling: disabled because archive was created without optimized module handling");
   }
 
-  if (is_static() && !_has_full_module_graph) {
+  if (is_static()) {
     // Only the static archive can contain the full module graph.
-    CDSConfig::stop_using_full_module_graph("archive was created without full module graph");
+    if (!_has_full_module_graph) {
+      CDSConfig::stop_using_full_module_graph("archive was created without full module graph");
+    }
+
+    if (_has_archived_invokedynamic) {
+      CDSConfig::set_is_loading_invokedynamic();
+    }
+    if (_has_archived_packages) {
+      CDSConfig::set_is_loading_packages();
+    }
   }
 
   return true;

@@ -24,6 +24,7 @@
 
 #include "precompiled.hpp"
 #include "classfile/vmClasses.hpp"
+#include "code/SCCache.hpp"
 #include "compiler/compilationMemoryStatistic.hpp"
 #include "compiler/compilerDefinitions.inline.hpp"
 #include "runtime/handles.inline.hpp"
@@ -61,6 +62,10 @@ const char* C2Compiler::retry_no_superword() {
   return "retry without SuperWord";
 }
 
+const char* C2Compiler::retry_no_clinit_barriers() {
+  return "retry without class initialization barriers";
+}
+
 void compiler_stubs_init(bool in_compiler_thread);
 
 bool C2Compiler::init_c2_runtime() {
@@ -96,7 +101,11 @@ bool C2Compiler::init_c2_runtime() {
   CompilerThread* thread = CompilerThread::current();
 
   HandleMark handle_mark(thread);
-  return OptoRuntime::generate(thread->env());
+  bool success = OptoRuntime::generate(thread->env());
+  if (success) {
+    SCCache::init_opto_table();
+  }
+  return success;
 }
 
 void C2Compiler::initialize() {
@@ -117,8 +126,24 @@ void C2Compiler::initialize() {
 
 void C2Compiler::compile_method(ciEnv* env, ciMethod* target, int entry_bci, bool install_code, DirectiveSet* directive) {
   assert(is_initialized(), "Compiler thread must be initialized");
-
   CompilationMemoryStatisticMark cmsm(directive);
+  CompileTask* task = env->task();
+  if (install_code && task->is_scc()) {
+    bool success = SCCache::load_nmethod(env, target, entry_bci, this, CompLevel_full_optimization);
+    if (success) {
+      assert(task->is_success(), "sanity");
+      return;
+    }
+    if (!task->preload()) { // Do not mark entry if pre-loading failed - it can pass normal load
+      SCCache::invalidate(task->scc_entry()); // mark sca_entry as not entrant
+    }
+    if (SCCache::is_code_load_thread_on()) {
+      env->record_failure("Failed to load cached code");
+      // Bail out if failed to load cached code in SC thread
+      return;
+    }
+    task->clear_scc();
+  }
 
   bool subsume_loads = SubsumeLoads;
   bool do_escape_analysis = DoEscapeAnalysis;
@@ -127,7 +152,11 @@ void C2Compiler::compile_method(ciEnv* env, ciMethod* target, int entry_bci, boo
   bool eliminate_boxing = EliminateAutoBox;
   bool do_locks_coarsening = EliminateLocks;
   bool do_superword = UseSuperWord;
-
+  bool for_preload = (task->compile_reason() != CompileTask::Reason_Precompile) && // non-preload version is requested
+                     SCCache::gen_preload_code(target, entry_bci);
+  if (task->compile_reason() == CompileTask::Reason_PrecompileForPreload) {
+    assert(for_preload, "required");
+  }
   while (!env->failing()) {
     ResourceMark rm;
     // Attempt to compile while subsuming loads into machine instructions.
@@ -138,6 +167,7 @@ void C2Compiler::compile_method(ciEnv* env, ciMethod* target, int entry_bci, boo
                     eliminate_boxing,
                     do_locks_coarsening,
                     do_superword,
+                    for_preload,
                     install_code);
     Compile C(env, target, entry_bci, options, directive);
 
@@ -172,6 +202,11 @@ void C2Compiler::compile_method(ciEnv* env, ciMethod* target, int entry_bci, boo
         do_locks_coarsening = false;
         env->report_failure(C.failure_reason());
         continue;  // retry
+      }
+      if (C.failure_reason_is(retry_no_clinit_barriers())) {
+        assert(for_preload, "must make progress");
+        for_preload = false;
+        continue;
       }
       if (C.failure_reason_is(retry_no_superword())) {
         assert(do_superword, "must make progress");

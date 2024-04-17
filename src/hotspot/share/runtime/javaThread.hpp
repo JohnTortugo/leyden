@@ -120,7 +120,7 @@ class JavaThread: public Thread {
   // Deopt support
   DeoptResourceMark*  _deopt_mark;               // Holds special ResourceMark for deoptimization
 
-  CompiledMethod*       _deopt_nmethod;         // CompiledMethod that is currently being deoptimized
+  nmethod*      _deopt_nmethod;                  // nmethod that is currently being deoptimized
   vframeArray*  _vframe_array_head;              // Holds the heap of the active vframeArrays
   vframeArray*  _vframe_array_last;              // Holds last vFrameArray we popped
   // Holds updates by JVMTI agents for compiled frames that cannot be performed immediately. They
@@ -455,6 +455,8 @@ class JavaThread: public Thread {
   intx _held_monitor_count;  // used by continuations for fast lock detection
   intx _jni_monitor_count;
 
+  bool _can_call_java;
+
 private:
 
   friend class VMThread;
@@ -505,9 +507,22 @@ private:
 
   void cleanup_failed_attach_current_thread(bool is_daemon);
 
+  class NoJavaCodeMark : public StackObj {
+    friend JavaThread;
+    JavaThread* _target;
+    bool _orig;
+   public:
+    NoJavaCodeMark(JavaThread* t) : _target(t), _orig(t->_can_call_java) {
+      _target->_can_call_java = false;
+    }
+    ~NoJavaCodeMark() {
+      _target->_can_call_java = _orig;
+    }
+  };
+
   // Testers
   virtual bool is_Java_thread() const            { return true;  }
-  virtual bool can_call_java() const             { return true; }
+  virtual bool can_call_java() const             { return _can_call_java; }
 
   virtual bool is_active_Java_thread() const;
 
@@ -686,8 +701,8 @@ private:
   void set_deopt_mark(DeoptResourceMark* value)  { _deopt_mark = value; }
   DeoptResourceMark* deopt_mark(void)            { return _deopt_mark; }
 
-  void set_deopt_compiled_method(CompiledMethod* nm)  { _deopt_nmethod = nm; }
-  CompiledMethod* deopt_compiled_method()        { return _deopt_nmethod; }
+  void set_deopt_compiled_method(nmethod* nm)    { _deopt_nmethod = nm; }
+  nmethod* deopt_compiled_method()               { return _deopt_nmethod; }
 
   Method*    callee_target() const               { return _callee_target; }
   void set_callee_target  (Method* x)            { _callee_target   = x; }
@@ -954,6 +969,8 @@ private:
   // or vthread as applicable.
   void print_jni_stack();
 
+  void print_native_stack_on(outputStream* st);
+
   // Print stack traces in various internal formats
   void trace_stack()                             PRODUCT_RETURN;
   void trace_stack_from(vframe* start_vf)        PRODUCT_RETURN;
@@ -1136,8 +1153,14 @@ private:
   void set_class_to_be_initialized(InstanceKlass* k);
   InstanceKlass* class_to_be_initialized() const;
 
+  // The most recent active <clinit> invocation is tracked by this variable.
+  // The setter returns the previous value, so it can be restored later if needed.
+  InstanceKlass* set_class_being_initialized(InstanceKlass* k);
+  InstanceKlass* class_being_initialized() const;
+
 private:
   InstanceKlass* _class_to_be_initialized;
+  InstanceKlass* _class_being_initialized;
 
   // java.lang.Thread.sleep support
   ParkEvent * _SleepEvent;

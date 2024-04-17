@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -804,13 +804,13 @@ class CompileReplay : public StackObj {
       }
     }
     // Make sure the existence of a prior compile doesn't stop this one
-    CompiledMethod* nm = (entry_bci != InvocationEntryBci) ? method->lookup_osr_nmethod_for(entry_bci, comp_level, true) : method->code();
+    nmethod* nm = (entry_bci != InvocationEntryBci) ? method->lookup_osr_nmethod_for(entry_bci, comp_level, true) : method->code();
     if (nm != nullptr) {
       nm->make_not_entrant();
     }
     replay_state = this;
     CompileBroker::compile_method(methodHandle(THREAD, method), entry_bci, comp_level,
-                                  methodHandle(), 0, CompileTask::Reason_Replay, THREAD);
+                                  methodHandle(), 0, true, CompileTask::Reason_Replay, THREAD);
     replay_state = nullptr;
   }
 

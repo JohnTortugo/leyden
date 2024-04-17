@@ -793,6 +793,7 @@ int java_lang_Class::_name_offset;
 int java_lang_Class::_source_file_offset;
 int java_lang_Class::_classData_offset;
 int java_lang_Class::_classRedefinedCount_offset;
+int java_lang_Class::_reflectionData_offset;
 
 bool java_lang_Class::_offsets_computed = false;
 GrowableArray<Klass*>* java_lang_Class::_fixup_mirror_list = nullptr;
@@ -1214,6 +1215,20 @@ void java_lang_Class::set_class_data(oop java_class, oop class_data) {
   java_class->obj_field_put(_classData_offset, class_data);
 }
 
+oop java_lang_Class::reflection_data(oop java_class) {
+  assert(_reflectionData_offset != 0, "must be set");
+  return java_class->obj_field(_reflectionData_offset);
+}
+
+bool java_lang_Class::has_reflection_data(oop java_class) {
+  return (java_lang_Class::reflection_data(java_class) != nullptr);
+}
+
+void java_lang_Class::set_reflection_data(oop java_class, oop reflection_data) {
+  assert(_reflectionData_offset != 0, "must be set");
+  java_class->obj_field_put(_reflectionData_offset, reflection_data);
+}
+
 void java_lang_Class::set_class_loader(oop java_class, oop loader) {
   assert(_class_loader_offset != 0, "offsets should have been initialized");
   java_class->obj_field_put(_class_loader_offset, loader);
@@ -1403,7 +1418,8 @@ oop java_lang_Class::primitive_mirror(BasicType t) {
   macro(_component_mirror_offset,    k, "componentType",       class_signature,       false); \
   macro(_module_offset,              k, "module",              module_signature,      false); \
   macro(_name_offset,                k, "name",                string_signature,      false); \
-  macro(_classData_offset,           k, "classData",           object_signature,      false);
+  macro(_classData_offset,           k, "classData",           object_signature,      false); \
+  macro(_reflectionData_offset,      k, "reflectionData",      class_ReflectionData_signature, false); \
 
 void java_lang_Class::compute_offsets() {
   if (_offsets_computed) {
@@ -2108,6 +2124,10 @@ void java_lang_Throwable::clear_stacktrace(oop throwable) {
   set_stacktrace(throwable, nullptr);
 }
 
+oop java_lang_Throwable::create_exception_instance(Symbol* class_name, TRAPS) {
+  Klass* k = SystemDictionary::resolve_or_fail(class_name, true, CHECK_NULL);
+  return InstanceKlass::cast(k)->allocate_instance(CHECK_NULL);
+}
 
 void java_lang_Throwable::print(oop throwable, outputStream* st) {
   ResourceMark rm;
@@ -2417,7 +2437,7 @@ static void print_stack_element_to_stream(outputStream* st, Handle mirror, int m
         // Neither sourcename nor linenumber
         buf_off += os::snprintf_checked(buf + buf_off, buf_size - buf_off, "Unknown Source)");
       }
-      CompiledMethod* nm = method->code();
+      nmethod* nm = method->code();
       if (WizardMode && nm != nullptr) {
         os::snprintf_checked(buf + buf_off, buf_size - buf_off, "(nmethod " INTPTR_FORMAT ")", (intptr_t)nm);
       }
@@ -2543,7 +2563,7 @@ void java_lang_Throwable::fill_in_stack_trace(Handle throwable, const methodHand
                   RegisterMap::ProcessFrames::skip,
                   RegisterMap::WalkContinuation::include);
   int decode_offset = 0;
-  CompiledMethod* nm = nullptr;
+  nmethod* nm = nullptr;
   bool skip_fillInStackTrace_check = false;
   bool skip_throwableInit_check = false;
   bool skip_hidden = !ShowHiddenFrames;
@@ -2587,10 +2607,10 @@ void java_lang_Throwable::fill_in_stack_trace(Handle throwable, const methodHand
         // HMMM QQQ might be nice to have frame return nm as null if cb is non-null
         // but non nmethod
         fr = fr.sender(&map);
-        if (cb == nullptr || !cb->is_compiled()) {
+        if (cb == nullptr || !cb->is_nmethod()) {
           continue;
         }
-        nm = cb->as_compiled_method();
+        nm = cb->as_nmethod();
         assert(nm->method() != nullptr, "must be");
         if (nm->method()->is_native()) {
           method = nm->method();
@@ -5359,6 +5379,7 @@ bool JavaClasses::is_supported_for_archiving(oop obj) {
   Klass* klass = obj->klass();
 
   if (klass == vmClasses::ClassLoader_klass() ||  // ClassLoader::loader_data is malloc'ed.
+#if 0
       // The next 3 classes are used to implement java.lang.invoke, and are not used directly in
       // regular Java code. The implementation of java.lang.invoke uses generated hidden classes
       // (e.g., as referenced by ResolvedMethodName::vmholder) that are not yet supported by CDS.
@@ -5369,6 +5390,7 @@ bool JavaClasses::is_supported_for_archiving(oop obj) {
       klass == vmClasses::ResolvedMethodName_klass() ||
       klass == vmClasses::MemberName_klass() ||
       klass == vmClasses::Context_klass() ||
+#endif
       // It's problematic to archive Reference objects. One of the reasons is that
       // Reference::discovered may pull in unwanted objects (see JDK-8284336)
       klass->is_subclass_of(vmClasses::Reference_klass())) {

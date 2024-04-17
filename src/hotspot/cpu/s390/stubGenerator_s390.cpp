@@ -3237,7 +3237,6 @@ class StubGenerator: public StubCodeGenerator {
       StubRoutines::_sha512_implCompress   = generate_SHA512_stub(false, "SHA512_singleBlock");
       StubRoutines::_sha512_implCompressMB = generate_SHA512_stub(true,  "SHA512_multiBlock");
     }
-
 #ifdef COMPILER2
     if (UseMultiplyToLenIntrinsic) {
       StubRoutines::_multiplyToLen = generate_multiplyToLen();

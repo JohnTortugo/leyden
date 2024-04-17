@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -64,6 +64,12 @@ void RegeneratedClasses::add_class(InstanceKlass* orig_klass, InstanceKlass* reg
       _renegerated_objs->put((address)orig_m, (address)regen_m);
     }
   }
+
+  if (log_is_enabled(Info, cds)) {
+    ResourceMark rm;
+    log_info(cds)("Regenerated class %s: methods %d -> %d)", orig_klass->external_name(),
+                  orig_klass->methods()->length(), regen_klass->methods()->length());
+  }
 }
 
 bool RegeneratedClasses::has_been_regenerated(address orig_obj) {
@@ -72,6 +78,25 @@ bool RegeneratedClasses::has_been_regenerated(address orig_obj) {
   } else {
     return _renegerated_objs->get(orig_obj) != nullptr;
   }
+}
+
+address RegeneratedClasses::get_regenerated_object(address orig_obj) {
+  assert(_renegerated_objs != nullptr, "must be");
+  address* p =_renegerated_objs->get(orig_obj);
+  assert(p != nullptr, "must be");
+  return *p;
+}
+
+bool RegeneratedClasses::is_a_regenerated_object(address obj) {
+#if 0
+  if (_original_objs == nullptr) {
+    return false;
+  } else {
+    return _original_objs->get(obj) != nullptr;
+  }
+#else
+  return false; // FIXME-MERGE
+#endif
 }
 
 void RegeneratedClasses::record_regenerated_objects() {

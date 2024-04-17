@@ -100,6 +100,18 @@ void ClassLoaderExt::process_module_table(JavaThread* current, ModuleEntryTable*
     ModulePathsGatherer(JavaThread* current, GrowableArray<char*>* module_paths) :
       _current(current), _module_paths(module_paths) {}
     void do_module(ModuleEntry* m) {
+      if (m->location() == nullptr) {
+        // This is a dynamic generated module (which we loaded from the static archive) for supporting
+        // dynamic proxies. We don't archive any other such modules.
+        // No need to include such modules in _module_path.
+        assert(CDSConfig::is_dumping_dynamic_archive(), "must be");
+        assert(Modules::is_dynamic_proxy_module(m), "must be");
+        if (log_is_enabled(Info, cds, dynamic, proxy)) {
+          ResourceMark rm;
+          log_info(cds, dynamic, proxy)("Archived dynamic module: %s", m->name()->as_C_string());
+        }
+        return;
+      }
       char* path = m->location()->as_C_string();
       if (strncmp(path, "file:", 5) == 0) {
         path = ClassLoader::skip_uri_protocol(path);
@@ -292,4 +304,65 @@ void ClassLoaderExt::record_result(const s2 classpath_index, InstanceKlass* resu
     HeapShared::disable_writing();
   }
 #endif // INCLUDE_CDS_JAVA_HEAP
+  if (CDSConfig::is_dumping_preimage_static_archive() || CDSConfig::is_dumping_dynamic_archive()) {
+    check_invalid_classpath_index(classpath_index, result);
+  }
+}
+
+ClassPathEntry* ClassLoaderExt::get_class_path_entry(s2 classpath_index) {
+  if (classpath_index < 0) {
+    return nullptr;
+  }
+
+  if (classpath_index == 0) {
+    assert(has_jrt_entry(), "CDS requires modules image");
+    return get_jrt_entry();
+  }
+
+  // Iterate over -Xbootclasspath, if any;
+  int i = 0;
+  for (ClassPathEntry* cpe = first_append_entry(); cpe != nullptr; cpe = cpe->next()) {
+    i++;
+    if (i == classpath_index) {
+      return cpe;
+    }
+  }
+
+  // Iterate over -cp, if any
+  for (ClassPathEntry* cpe = app_classpath_entries(); cpe != nullptr; cpe = cpe->next()) {
+    i++;
+    if (i == classpath_index) {
+      return cpe;
+    }
+  }
+
+  // Iterate over --module-path, if any
+  for (ClassPathEntry* cpe = module_path_entries(); cpe != nullptr; cpe = cpe->next()) {
+    i++;
+    if (i == classpath_index) {
+      return cpe;
+    }
+  }
+
+  return nullptr;
+}
+
+// It's possible to use reflection+setAccessible to call into ClassLoader::defineClass() to
+// pretend that a dynamically generated class comes from a JAR file in the classpath.
+// Detect such classes and exclude them from the archive.
+void ClassLoaderExt::check_invalid_classpath_index(s2 classpath_index, InstanceKlass* ik) {
+  ClassPathEntry *cpe = get_class_path_entry(classpath_index);
+  if (cpe != nullptr && cpe->is_jar_file()) {
+    ClassPathZipEntry *zip = (ClassPathZipEntry*)cpe;
+    JavaThread* current = JavaThread::current();
+    ResourceMark rm(current);
+    const char* const class_name = ik->name()->as_C_string();
+    const char* const file_name = file_name_for_class_name(class_name,
+                                                           ik->name()->utf8_length());
+    if (!zip->has_entry(current, file_name)) {
+      log_warning(cds)("class %s cannot be archived because it was not define from %s as claimed",
+                       class_name, zip->name());
+      ik->set_shared_classpath_index(-1);
+    }
+  }
 }

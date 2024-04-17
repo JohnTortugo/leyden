@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -34,11 +34,10 @@
 
 #include <new>
 
-class nmethod;
 class CodeBlob;
-class CompiledMethod;
 class Metadata;
 class NativeMovConstReg;
+class nmethod;
 
 // Types in this file:
 //    relocInfo
@@ -457,6 +456,8 @@ class relocInfo {
     length_limit       = 1 + 1 + (3*BytesPerWord/BytesPerShort) + 1,
     have_format        = format_width > 0
   };
+
+  static const char* type_name(relocInfo::relocType t);
 };
 
 #define FORWARD_DECLARE_EACH_CLASS(name)              \
@@ -571,7 +572,7 @@ class RelocIterator : public StackObj {
   address         _limit;   // stop producing relocations after this _addr
   relocInfo*      _current; // the current relocation information
   relocInfo*      _end;     // end marker; we're done iterating when _current == _end
-  CompiledMethod* _code;    // compiled method containing _addr
+  nmethod*        _code;    // compiled method containing _addr
   address         _addr;    // instruction to which the relocation applies
   short           _databuf; // spare buffer for compressed data
   short*          _data;    // pointer to the relocation's data
@@ -601,13 +602,13 @@ class RelocIterator : public StackObj {
 
   void initialize_misc();
 
-  void initialize(CompiledMethod* nm, address begin, address limit);
+  void initialize(nmethod* nm, address begin, address limit);
 
   RelocIterator() { initialize_misc(); }
 
  public:
   // constructor
-  RelocIterator(CompiledMethod* nm, address begin = nullptr, address limit = nullptr);
+  RelocIterator(nmethod* nm, address begin = nullptr, address limit = nullptr);
   RelocIterator(CodeSection* cb, address begin = nullptr, address limit = nullptr);
 
   // get next reloc info, return !eos
@@ -640,18 +641,18 @@ class RelocIterator : public StackObj {
   relocType    type()         const { return current()->type(); }
   int          format()       const { return (relocInfo::have_format) ? current()->format() : 0; }
   address      addr()         const { return _addr; }
-  CompiledMethod*     code()  const { return _code; }
+  nmethod*     code()         const { return _code; }
   short*       data()         const { return _data; }
   int          datalen()      const { return _datalen; }
   bool     has_current()      const { return _datalen >= 0; }
   bool   addr_in_const()      const;
 
   address section_start(int n) const {
-    assert(_section_start[n], "must be initialized");
+    assert(_section_start[n], "section %d must be initialized", n);
     return _section_start[n];
   }
   address section_end(int n) const {
-    assert(_section_end[n], "must be initialized");
+    assert(_section_end[n], "section %d must be initialized", n);
     return _section_end[n];
   }
 
@@ -667,11 +668,9 @@ class RelocIterator : public StackObj {
   // generic relocation accessor; switches on type to call the above
   Relocation* reloc();
 
-#ifndef PRODUCT
  public:
-  void print();
-  void print_current();
-#endif
+  void print_on(outputStream* st);
+  void print_current_on(outputStream* st);
 };
 
 
@@ -827,7 +826,7 @@ class Relocation {
  public:
   // accessors which only make sense for a bound Relocation
   address         addr()            const { return binding()->addr(); }
-  CompiledMethod* code()            const { return binding()->code(); }
+  nmethod*        code()            const { return binding()->code(); }
   bool            addr_in_const()   const { return binding()->addr_in_const(); }
  protected:
   short*   data()         const { return binding()->data(); }
@@ -1312,6 +1311,25 @@ class trampoline_stub_Relocation : public Relocation {
 
   void pack_data_to(CodeSection * dest) override;
   void unpack_data() override;
+#if defined(AARCH64)
+  address    pd_destination     ();
+  void       pd_set_destination (address x);
+#endif
+  address  destination() {
+#if defined(AARCH64)
+    return pd_destination();
+#else
+    fatal("trampoline_stub_Relocation::destination() unimplemented");
+    return (address)-1;
+#endif
+  }
+  void     set_destination(address x) {
+#if defined(AARCH64)
+    pd_set_destination(x);
+#else
+    fatal("trampoline_stub_Relocation::set_destination() unimplemented");
+#endif
+  }
 
   // Find the trampoline stub for a call.
   static address get_trampoline_for(address call, nmethod* code);
@@ -1356,6 +1374,7 @@ class external_word_Relocation : public DataRelocation {
   // in the code stream.  See external_word_Relocation::target().
   void pack_data_to(CodeSection* dest) override;
   void unpack_data() override;
+  short* pack_data_to(short* p); // Pack address into buffer
 
   void fix_relocation_after_move(const CodeBuffer* src, CodeBuffer* dest) override;
   address  target();        // if _target==nullptr, fetch addr from code stream
@@ -1463,7 +1482,7 @@ APPLY_TO_RELOCATIONS(EACH_CASE);
 #undef EACH_CASE_AUX
 #undef EACH_CASE
 
-inline RelocIterator::RelocIterator(CompiledMethod* nm, address begin, address limit) {
+inline RelocIterator::RelocIterator(nmethod* nm, address begin, address limit) {
   initialize(nm, begin, limit);
 }
 

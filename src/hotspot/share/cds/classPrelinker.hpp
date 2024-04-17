@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2022, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,6 +25,7 @@
 #ifndef SHARE_CDS_CLASSPRELINKER_HPP
 #define SHARE_CDS_CLASSPRELINKER_HPP
 
+#include "interpreter/bytecodes.hpp"
 #include "oops/oopsHierarchy.hpp"
 #include "memory/allStatic.hpp"
 #include "memory/allocation.hpp"
@@ -37,7 +38,10 @@ class ConstantPool;
 class constantPoolHandle;
 class InstanceKlass;
 class Klass;
+class SerializeClosure;
 
+template <typename T> class Array;
+template <typename T> class GrowableArray;
 // ClassPrelinker is used to perform ahead-of-time linking of ConstantPool entries
 // for archived InstanceKlasses.
 //
@@ -49,9 +53,12 @@ class Klass;
 // at dump time, because at run time we will load a class from the CDS archive only
 // if all of its supertypes are loaded from the CDS archive.
 class ClassPrelinker :  AllStatic {
+  class PreloadedKlassRecorder;
   using ClassesTable = ResourceHashtable<InstanceKlass*, bool, 15889, AnyObj::C_HEAP, mtClassShared> ;
   static ClassesTable* _processed_classes;
+  // Classes loaded inside vmClasses::resolve_all()
   static ClassesTable* _vm_classes;
+  static int _num_vm_klasses;
 
   static void add_one_vm_class(InstanceKlass* ik);
 
@@ -65,27 +72,65 @@ class ClassPrelinker :  AllStatic {
   }
   static void resolve_string(constantPoolHandle cp, int cp_index, TRAPS) NOT_CDS_JAVA_HEAP_RETURN;
   static Klass* maybe_resolve_class(constantPoolHandle cp, int cp_index, TRAPS);
-  static bool can_archive_resolved_klass(InstanceKlass* cp_holder, Klass* resolved_klass);
-  static Klass* find_loaded_class(JavaThread* THREAD, oop class_loader, Symbol* name);
+  static bool is_klass_resolution_deterministic(InstanceKlass* cp_holder, Klass* resolved_klass);
+  static bool is_indy_resolution_deterministic(ConstantPool* cp, int cp_index);
+
+  static Klass* find_loaded_class(Thread* current, oop class_loader, Symbol* name);
+  static Klass* find_loaded_class(Thread* current, ConstantPool* cp, int class_cp_index);
+
+  // fmi = FieldRef/MethodRef/InterfaceMethodRef
+  static void maybe_resolve_fmi_ref(InstanceKlass* ik, Method* m, Bytecodes::Code bc, int raw_index,
+                                    GrowableArray<bool>* resolve_fmi_list, TRAPS);
+  class RecordResolveIndysCLDClosure;
+
+  // helper
+  static Klass* resolve_boot_klass_or_fail(const char* class_name, TRAPS);
+
+  // java/lang/reflect/Proxy caching
+  static void init_dynamic_proxy_cache(TRAPS);
+
+  // Preinitialize classes during dump time
+  static bool has_non_default_static_fields(InstanceKlass* ik);
+  static bool is_forced_preinit_class(InstanceKlass* ik);
 
 public:
   static void initialize();
   static void dispose();
+
+  // Preinitialize classes during dump time
+  static bool check_can_be_preinited(InstanceKlass* ik);
+  static void maybe_preinit_class(InstanceKlass* ik, TRAPS);
+
+  static void preresolve_class_cp_entries(JavaThread* current, InstanceKlass* ik, GrowableArray<bool>* preresolve_list);
+  static void preresolve_field_and_method_cp_entries(JavaThread* current, InstanceKlass* ik, GrowableArray<bool>* preresolve_list);
+  static void preresolve_indy_cp_entries(JavaThread* current, InstanceKlass* ik, GrowableArray<bool>* preresolve_list);
+  static void preresolve_invoker_class(JavaThread* current, InstanceKlass* ik);
+  static void apply_final_image_eager_linkage(TRAPS);
+
+  // java/lang/Class$ReflectionData caching
+  static void record_reflection_data_flags_for_preimage(InstanceKlass* ik, TRAPS);
+  static int class_reflection_data_flags(InstanceKlass* ik, TRAPS);
+  static void generate_reflection_data(JavaThread* current, InstanceKlass* ik, int rd_flags);
+
+  // java/lang/reflect/Proxy caching
+  static void trace_dynamic_proxy_class(oop loader, const char* proxy_name, objArrayOop interfaces, int access_flags);
+  static void define_dynamic_proxy_class(Handle loader, Handle proxy_name, Handle interfaces, int access_flags, TRAPS);
 
   // Is this class resolved as part of vmClasses::resolve_all()? If so, these
   // classes are guatanteed to be loaded at runtime (and cannot be replaced by JVMTI)
   // when CDS is enabled. Therefore, we can safely keep a direct reference to these
   // classes.
   static bool is_vm_class(InstanceKlass* ik);
-
   // Resolve all constant pool entries that are safe to be stored in the
   // CDS archive.
   static void dumptime_resolve_constants(InstanceKlass* ik, TRAPS);
 
-  // Can we resolve the klass entry at cp_index in this constant pool, and store
-  // the result in the CDS archive? Returns true if cp_index is guaranteed to
-  // resolve to the same InstanceKlass* at both dump time and run time.
-  static bool can_archive_resolved_klass(ConstantPool* cp, int cp_index);
+  static bool is_resolution_deterministic(ConstantPool* cp, int cp_index);
+
+  static bool can_archive_preinitialized_mirror(InstanceKlass* src_ik);
+
+  static void record_final_image_eager_linkage();
+  static void serialize(SerializeClosure* soc, bool is_static_archive);
 };
 
 #endif // SHARE_CDS_CLASSPRELINKER_HPP

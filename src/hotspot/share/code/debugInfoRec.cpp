@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1998, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -144,6 +144,28 @@ DebugInformationRecorder::DebugInformationRecorder(OopRecorder* oop_recorder)
   debug_only(_recording_state = rs_null);
 }
 
+DebugInformationRecorder::DebugInformationRecorder(OopRecorder* oop_recorder, int data_size, int pcs_length)
+  : _recording_non_safepoints(compute_recording_non_safepoints())
+{
+  _pcs_size   = _pcs_length = pcs_length;
+  _pcs        = NEW_RESOURCE_ARRAY(PcDesc, _pcs_size);
+
+  _prev_safepoint_pc = PcDesc::lower_offset_limit;
+
+  _stream = new DebugInfoWriteStream(this, data_size);
+  // make sure that there is no stream_decode_offset that is zero
+  _stream->write_byte((jbyte)0xFF);
+
+  // make sure that we can distinguish the value "serialized_null" from offsets
+  assert(_stream->position() > serialized_null, "sanity");
+
+  _oop_recorder = oop_recorder;
+
+  _all_chunks = nullptr;
+  _next_chunk = _next_chunk_limit = nullptr;
+
+  debug_only(_recording_state = rs_null);
+}
 
 void DebugInformationRecorder::add_oopmap(int pc_offset, OopMap* map) {
   // !!!!! Preserve old style handling of oopmaps for now
@@ -175,7 +197,7 @@ void DebugInformationRecorder::add_non_safepoint(int pc_offset) {
 
 void DebugInformationRecorder::add_new_pc_offset(int pc_offset) {
   assert(_pcs_length == 0 || last_pc()->pc_offset() < pc_offset,
-         "must specify a new, larger pc offset");
+         "must specify a new, larger pc offset: %d >= %d", last_pc()->pc_offset(), pc_offset);
 
   // add the pcdesc
   if (_pcs_length == _pcs_size) {

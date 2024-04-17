@@ -224,7 +224,10 @@ private:
   bool   _allow_archiving_with_java_agent; // setting of the AllowArchivingWithJavaAgent option
   bool   _use_optimized_module_handling;// No module-relation VM options were specified, so we can skip
                                         // some expensive operations.
+  bool   _has_preloaded_classes;        // Does the CDS archive have preloaded classes?
   bool   _has_full_module_graph;        // Does this CDS archive contain the full archived module graph?
+  bool   _has_archived_invokedynamic;   // Does the archive have preresolved invokedynamic CP entries?
+  bool   _has_archived_packages;
   size_t _ptrmap_size_in_bits;          // Size of pointer relocation bitmap
   size_t _heap_roots_offset;            // Offset of the HeapShared::roots() object, from the bottom
                                         // of the archived heap objects, in bytes.
@@ -267,6 +270,7 @@ public:
   char* mapped_base_address()              const { return _mapped_base_address; }
   bool has_platform_or_app_classes()       const { return _has_platform_or_app_classes; }
   bool has_non_jar_in_classpath()          const { return _has_non_jar_in_classpath; }
+  bool has_preloaded_classes()             const { return _has_preloaded_classes; }
   size_t ptrmap_size_in_bits()             const { return _ptrmap_size_in_bits; }
   bool compressed_oops()                   const { return _compressed_oops; }
   bool compressed_class_pointers()         const { return _compressed_class_ptrs; }
@@ -459,6 +463,7 @@ public:
   MemRegion get_heap_region_requested_range() NOT_CDS_JAVA_HEAP_RETURN_(MemRegion());
   bool  read_region(int i, char* base, size_t size, bool do_commit);
   char* map_bitmap_region();
+  bool map_cached_code_region(ReservedSpace rs);
   void  unmap_region(int i);
   void  close();
   bool  is_open() { return _file_open; }
@@ -557,7 +562,7 @@ public:
   void  init_heap_region_relocation();
   MapArchiveResult map_region(int i, intx addr_delta, char* mapped_base_address, ReservedSpace rs);
   bool  relocate_pointers_in_core_regions(intx addr_delta);
-
+  void  relocate_pointers_in_cached_code_region();
   static MemRegion _mapped_heap_memregion;
 
 public:

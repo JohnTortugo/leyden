@@ -113,7 +113,7 @@ typedef const TypeFunc*(*TypeFunc_generator)();
 
 class OptoRuntime : public AllStatic {
   friend class Matcher;  // allow access to stub names
-
+  friend class SCAddressTable;
  private:
   // define stubs
   static address generate_stub(ciEnv* ci_env, TypeFunc_generator gen, address C_function, const char* name, int is_fancy_jump, bool pass_tls, bool return_pc);
@@ -135,6 +135,7 @@ class OptoRuntime : public AllStatic {
 
   static address _slow_arraycopy_Java;
   static address _register_finalizer_Java;
+  static address _class_init_barrier_Java;
 #if INCLUDE_JVMTI
   static address _notify_jvmti_vthread_start;
   static address _notify_jvmti_vthread_end;
@@ -186,6 +187,7 @@ private:
 
   static void register_finalizer(oopDesc* obj, JavaThread* current);
 
+  static void class_init_barrier(Klass* k, JavaThread* current);
  public:
 
   static bool is_callee_saved_register(MachRegisterNumbers reg);
@@ -214,6 +216,7 @@ private:
 
   static address slow_arraycopy_Java()                   { return _slow_arraycopy_Java; }
   static address register_finalizer_Java()               { return _register_finalizer_Java; }
+  static address class_init_barrier_Java()               { return _class_init_barrier_Java; }
 #if INCLUDE_JVMTI
   static address notify_jvmti_vthread_start()            { return _notify_jvmti_vthread_start; }
   static address notify_jvmti_vthread_end()              { return _notify_jvmti_vthread_end; }
@@ -307,6 +310,8 @@ private:
 
   static const TypeFunc* register_finalizer_Type();
 
+  static const TypeFunc* class_init_barrier_Type();
+
   JFR_ONLY(static const TypeFunc* class_id_load_barrier_Type();)
 #if INCLUDE_JVMTI
   static const TypeFunc* notify_jvmti_vthread_Type();
@@ -327,6 +332,9 @@ private:
  // dumps all the named counters
  static void          print_named_counters();
 
+ public:
+  static void init_counters();
+  static void print_counters_on(outputStream* st);
 };
 
 #endif // SHARE_OPTO_RUNTIME_HPP

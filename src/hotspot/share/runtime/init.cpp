@@ -23,8 +23,11 @@
  */
 
 #include "precompiled.hpp"
+#include "cds/metaspaceShared.hpp"
 #include "classfile/stringTable.hpp"
 #include "classfile/symbolTable.hpp"
+#include "classfile/systemDictionary.hpp"
+#include "code/SCCache.hpp"
 #include "compiler/compiler_globals.hpp"
 #include "gc/shared/collectedHeap.hpp"
 #include "gc/shared/gcHeapSummary.hpp"
@@ -32,6 +35,7 @@
 #include "logging/logAsyncWriter.hpp"
 #include "memory/universe.hpp"
 #include "nmt/memTracker.hpp"
+#include "oops/trainingData.hpp"
 #include "prims/downcallLinker.hpp"
 #include "prims/jvmtiExport.hpp"
 #include "prims/methodHandles.hpp"
@@ -46,6 +50,7 @@
 #include "runtime/sharedRuntime.hpp"
 #include "sanitizers/leak.hpp"
 #include "utilities/macros.hpp"
+#include "utilities/xmlstream.hpp"
 #if INCLUDE_JVMCI
 #include "jvmci/jvmci.hpp"
 #endif
@@ -99,6 +104,8 @@ void final_stubs_init();    // final StubRoutines stubs
 void perfMemory_exit();
 void ostream_exit();
 
+void perf_jvm_init();
+
 void vm_init_globals() {
   check_ThreadShadow();
   basic_types_init();
@@ -111,6 +118,9 @@ void vm_init_globals() {
 
 
 jint init_globals() {
+  perf_jvm_init();
+  MethodHandles::init_counters();
+
   management_init();
   JvmtiExport::initialize_oop_storage();
 #if INCLUDE_JVMTI
@@ -122,6 +132,7 @@ jint init_globals() {
   bytecodes_init();
   classLoader_init1();
   compilationPolicy_init();
+  MetaspaceShared::open_static_archive();
   codeCache_init();
   VM_Version_init();              // depends on codeCache_init for emitting code
   initial_stubs_init();
@@ -129,7 +140,7 @@ jint init_globals() {
                                   // initial_stubs_init and metaspace_init.
   if (status != JNI_OK)
     return status;
-
+  SCCache::initialize();
 #ifdef LEAK_SANITIZER
   {
     // Register the Java heap with LSan.
@@ -137,7 +148,7 @@ jint init_globals() {
     LSAN_REGISTER_ROOT_REGION(summary.start(), summary.reserved_size());
   }
 #endif // LEAK_SANITIZER
-
+  SCCache::init2();        // depends on universe_init
   AsyncLogWriter::initialize();
   gc_barrier_stubs_init();   // depends on universe_init, must be before interpreter_init
   continuations_init();      // must precede continuation stub generation
@@ -176,17 +187,24 @@ jint init_globals2() {
   }
 #endif
 
+  if (TrainingData::have_data() || TrainingData::need_data()) {
+    TrainingData::initialize();
+  }
+
   if (!universe_post_init()) {
     return JNI_ERR;
   }
   compiler_stubs_init(false /* in_compiler_thread */); // compiler's intrinsics stubs
   final_stubs_init();    // final StubRoutines stubs
   MethodHandles::generate_adapters();
+  SystemDictionary::restore_archived_method_handle_intrinsics();
 
   // All the flags that get adjusted by VM_Version_init and os::init_2
   // have been set so dump the flags now.
   if (PrintFlagsFinal || PrintFlagsRanges) {
     JVMFlag::printFlags(tty, false, PrintFlagsRanges);
+  } else if (RecordTraining && xtty != nullptr) {
+    JVMFlag::printFlags(xtty->log_only(), false, PrintFlagsRanges);
   }
 
   return JNI_OK;

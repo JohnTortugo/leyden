@@ -229,6 +229,10 @@ class Universe: AllStatic {
   static oop          virtual_machine_error_instance();
   static oop          vm_exception()                  { return virtual_machine_error_instance(); }
 
+  static oop          array_index_oob_exception_instance();
+  static oop          array_store_exception_instance();
+  static oop          class_cast_exception_instance();
+
   static Array<Klass*>* the_array_interfaces_array()  { return _the_array_interfaces_array;   }
 
   static Method*      finalizer_register_method();

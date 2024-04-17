@@ -29,6 +29,8 @@
 #include "utilities/globalDefinitions.hpp"
 #include "utilities/macros.hpp"
 
+class InstanceKlass;
+
 class CDSConfig : public AllStatic {
 #if INCLUDE_CDS
   static bool _is_dumping_static_archive;
@@ -36,6 +38,9 @@ class CDSConfig : public AllStatic {
   static bool _is_using_optimized_module_handling;
   static bool _is_dumping_full_module_graph;
   static bool _is_using_full_module_graph;
+  static bool _has_preloaded_classes;
+  static bool _is_loading_invokedynamic;
+  static bool _is_loading_packages;
 
   static char* _default_archive_path;
   static char* _static_archive_path;
@@ -53,6 +58,9 @@ public:
   static const int IS_DUMPING_STATIC_ARCHIVE       = 1 << 1;
   static const int IS_LOGGING_LAMBDA_FORM_INVOKERS = 1 << 2;
   static const int IS_USING_ARCHIVE                = 1 << 3;
+  static const int IS_DUMPING_HEAP                 = 1 << 4;
+  static const int IS_LOGGING_DYNAMIC_PROXIES      = 1 << 5;
+  static const int IS_DUMPING_PACKAGES             = 1 << 6;
   static int get_status() NOT_CDS_RETURN_(0);
 
   // Initialization and command-line checking
@@ -71,19 +79,31 @@ public:
   static int num_archives(const char* archive_path)          NOT_CDS_RETURN_(0);
 
   // static_archive
-  static bool is_dumping_static_archive()                    { return CDS_ONLY(_is_dumping_static_archive) NOT_CDS(false); }
+  static bool is_dumping_static_archive()                    { return (CDS_ONLY(_is_dumping_static_archive) NOT_CDS(false))
+                                                                    || is_dumping_final_static_archive(); }
   static void enable_dumping_static_archive()                { CDS_ONLY(_is_dumping_static_archive = true); }
+
+  static bool is_dumping_classic_static_archive()            NOT_CDS_RETURN_(false); // -Xshare:dump
+  static bool is_dumping_preimage_static_archive()           NOT_CDS_RETURN_(false); // 1st phase of -XX:CacheDataStore dumping
+  static bool is_dumping_final_static_archive()              NOT_CDS_RETURN_(false); // 2nd phase of -XX:CacheDataStore dumping
 
   // dynamic_archive
   static bool is_dumping_dynamic_archive()                   { return CDS_ONLY(_is_dumping_dynamic_archive) NOT_CDS(false); }
   static void enable_dumping_dynamic_archive()               { CDS_ONLY(_is_dumping_dynamic_archive = true); }
   static void disable_dumping_dynamic_archive()              { CDS_ONLY(_is_dumping_dynamic_archive = false); }
 
+  // Misc CDS features
+  static bool preserve_all_dumptime_verification_states(const InstanceKlass* ik);
+
   // optimized_module_handling -- can we skip some expensive operations related to modules?
   static bool is_using_optimized_module_handling()           { return CDS_ONLY(_is_using_optimized_module_handling) NOT_CDS(false); }
   static void stop_using_optimized_module_handling()         NOT_CDS_RETURN;
 
   static bool is_logging_lambda_form_invokers()              NOT_CDS_RETURN_(false);
+  static bool is_dumping_regenerated_lambdaform_invokers()   NOT_CDS_RETURN_(false);
+
+  static bool has_preloaded_classes()                        { CDS_ONLY(return _has_preloaded_classes); NOT_CDS(return false); }
+  static void set_has_preloaded_classes()                    { CDS_ONLY(_has_preloaded_classes = true); }
 
   // archive_path
 
@@ -96,13 +116,34 @@ public:
 
   // --- Archived java objects
 
-  static bool   is_dumping_heap()                            NOT_CDS_JAVA_HEAP_RETURN_(false);
+  static bool is_dumping_heap()                              NOT_CDS_JAVA_HEAP_RETURN_(false);
+  static bool is_loading_heap()                              NOT_CDS_JAVA_HEAP_RETURN_(false);
+
+  static bool is_dumping_invokedynamic()                     NOT_CDS_JAVA_HEAP_RETURN_(false);
+  static bool is_loading_invokedynamic()                     NOT_CDS_JAVA_HEAP_RETURN_(false);
+  static void set_is_loading_invokedynamic()                 { CDS_JAVA_HEAP_ONLY(_is_loading_invokedynamic = true); }
+
+  static bool is_dumping_packages()                          NOT_CDS_JAVA_HEAP_RETURN_(false);
+  static bool is_loading_packages()                          NOT_CDS_JAVA_HEAP_RETURN_(false);
+  static void set_is_loading_packages()                      { CDS_JAVA_HEAP_ONLY(_is_loading_packages = true); }
+
+  static bool is_dumping_dynamic_proxy()                     NOT_CDS_JAVA_HEAP_RETURN_(false);
+  static bool is_tracing_dynamic_proxy()                     NOT_CDS_RETURN_(false);
+
+  static bool is_initing_classes_at_dump_time()              NOT_CDS_JAVA_HEAP_RETURN_(false);
 
   // full_module_graph (requires optimized_module_handling)
   static bool is_dumping_full_module_graph()                 { return CDS_ONLY(_is_dumping_full_module_graph) NOT_CDS(false); }
   static bool is_using_full_module_graph()                   NOT_CDS_JAVA_HEAP_RETURN_(false);
   static void stop_dumping_full_module_graph(const char* reason = nullptr) NOT_CDS_JAVA_HEAP_RETURN;
   static void stop_using_full_module_graph(const char* reason = nullptr) NOT_CDS_JAVA_HEAP_RETURN;
+
+  // --- AOT compiler
+
+  static bool is_dumping_cached_code()                       NOT_CDS_RETURN_(false);
+  static void disable_dumping_cached_code()                  NOT_CDS_RETURN;
+  static void enable_dumping_cached_code()                   NOT_CDS_RETURN;
+
 };
 
 #endif // SHARE_CDS_CDSCONFIG_HPP

@@ -23,13 +23,14 @@
  */
 
 #include "precompiled.hpp"
+#include "classfile/classLoader.hpp"
 #include "classfile/javaClasses.inline.hpp"
 #include "classfile/stringTable.hpp"
 #include "classfile/vmClasses.hpp"
 #include "classfile/vmSymbols.hpp"
 #include "code/codeCache.hpp"
 #include "code/compiledIC.hpp"
-#include "code/compiledMethod.inline.hpp"
+#include "code/nmethod.inline.hpp"
 #include "code/scopeDesc.hpp"
 #include "code/vtableStubs.hpp"
 #include "compiler/abstractCompiler.hpp"
@@ -63,6 +64,7 @@
 #include "runtime/java.hpp"
 #include "runtime/javaCalls.hpp"
 #include "runtime/jniHandles.inline.hpp"
+#include "runtime/perfData.inline.hpp"
 #include "runtime/sharedRuntime.hpp"
 #include "runtime/stackWatermarkSet.hpp"
 #include "runtime/stubRoutines.hpp"
@@ -70,6 +72,7 @@
 #include "runtime/vframe.inline.hpp"
 #include "runtime/vframeArray.hpp"
 #include "runtime/vm_version.hpp"
+#include "services/management.hpp"
 #include "utilities/copy.hpp"
 #include "utilities/dtrace.hpp"
 #include "utilities/events.hpp"
@@ -103,6 +106,12 @@ UncommonTrapBlob*   SharedRuntime::_uncommon_trap_blob;
 
 nmethod*            SharedRuntime::_cont_doYield_stub;
 
+PerfTickCounters* SharedRuntime::_perf_resolve_opt_virtual_total_time = nullptr;
+PerfTickCounters* SharedRuntime::_perf_resolve_virtual_total_time     = nullptr;
+PerfTickCounters* SharedRuntime::_perf_resolve_static_total_time      = nullptr;
+PerfTickCounters* SharedRuntime::_perf_handle_wrong_method_total_time = nullptr;
+PerfTickCounters* SharedRuntime::_perf_ic_miss_total_time             = nullptr;
+
 //----------------------------generate_stubs-----------------------------------
 void SharedRuntime::generate_stubs() {
   _wrong_method_blob                   = generate_resolve_blob(CAST_FROM_FN_PTR(address, SharedRuntime::handle_wrong_method),          "wrong_method_stub");
@@ -130,19 +139,71 @@ void SharedRuntime::generate_stubs() {
 #ifdef COMPILER2
   generate_uncommon_trap_blob();
 #endif // COMPILER2
+  if (UsePerfData) {
+    EXCEPTION_MARK;
+    NEWPERFTICKCOUNTERS(_perf_resolve_opt_virtual_total_time, SUN_CI, "resovle_opt_virtual_call");
+    NEWPERFTICKCOUNTERS(_perf_resolve_virtual_total_time,     SUN_CI, "resovle_virtual_call");
+    NEWPERFTICKCOUNTERS(_perf_resolve_static_total_time,      SUN_CI, "resovle_static_call");
+    NEWPERFTICKCOUNTERS(_perf_handle_wrong_method_total_time, SUN_CI, "handle_wrong_method");
+    NEWPERFTICKCOUNTERS(_perf_ic_miss_total_time ,            SUN_CI, "ic_miss");
+    if (HAS_PENDING_EXCEPTION) {
+      vm_exit_during_initialization("SharedRuntime::generate_stubs() failed unexpectedly");
+    }
+  }
+}
+
+void SharedRuntime::print_counters_on(outputStream* st) {
+  st->print_cr("SharedRuntime:");
+  if (UsePerfData) {
+    st->print_cr("  resolve_opt_virtual_call: %5ldms (elapsed) %5ldms (thread) / %5d events",
+                 _perf_resolve_opt_virtual_total_time->elapsed_counter_value_ms(),
+                 _perf_resolve_opt_virtual_total_time->thread_counter_value_ms(),
+                 _resolve_opt_virtual_ctr);
+    st->print_cr("  resolve_virtual_call:     %5ldms (elapsed) %5ldms (thread) / %5d events",
+                 _perf_resolve_virtual_total_time->elapsed_counter_value_ms(),
+                 _perf_resolve_virtual_total_time->thread_counter_value_ms(),
+                 _resolve_virtual_ctr);
+    st->print_cr("  resolve_static_call:      %5ldms (elapsed) %5ldms (thread) / %5d events",
+                 _perf_resolve_static_total_time->elapsed_counter_value_ms(),
+                 _perf_resolve_static_total_time->thread_counter_value_ms(),
+                 _resolve_static_ctr);
+    st->print_cr("  handle_wrong_method:      %5ldms (elapsed) %5ldms (thread) / %5d events",
+                 _perf_handle_wrong_method_total_time->elapsed_counter_value_ms(),
+                 _perf_handle_wrong_method_total_time->thread_counter_value_ms(),
+                 _wrong_method_ctr);
+    st->print_cr("  ic_miss:                  %5ldms (elapsed) %5ldms (thread) / %5d events",
+                 _perf_ic_miss_total_time->elapsed_counter_value_ms(),
+                 _perf_ic_miss_total_time->thread_counter_value_ms(),
+                 _ic_miss_ctr);
+
+    jlong total_elapsed_time_ms = Management::ticks_to_ms(_perf_resolve_opt_virtual_total_time->elapsed_counter_value() +
+                                                          _perf_resolve_virtual_total_time->elapsed_counter_value() +
+                                                          _perf_resolve_static_total_time->elapsed_counter_value() +
+                                                          _perf_handle_wrong_method_total_time->elapsed_counter_value() +
+                                                          _perf_ic_miss_total_time->elapsed_counter_value());
+    jlong total_thread_time_ms = Management::ticks_to_ms(_perf_resolve_opt_virtual_total_time->thread_counter_value() +
+                                                          _perf_resolve_virtual_total_time->thread_counter_value() +
+                                                          _perf_resolve_static_total_time->thread_counter_value() +
+                                                          _perf_handle_wrong_method_total_time->thread_counter_value() +
+                                                          _perf_ic_miss_total_time->thread_counter_value());
+    st->print_cr("Total:                      %5ldms (elapsed) %5ldms (thread)", total_elapsed_time_ms, total_thread_time_ms);
+  } else {
+    st->print_cr("  no data (UsePerfData is turned off)");
+  }
 }
 
 #include <math.h>
 
 // Implementation of SharedRuntime
 
-#ifndef PRODUCT
 // For statistics
 uint SharedRuntime::_ic_miss_ctr = 0;
 uint SharedRuntime::_wrong_method_ctr = 0;
 uint SharedRuntime::_resolve_static_ctr = 0;
 uint SharedRuntime::_resolve_virtual_ctr = 0;
 uint SharedRuntime::_resolve_opt_virtual_ctr = 0;
+
+#ifndef PRODUCT
 uint SharedRuntime::_implicit_null_throws = 0;
 uint SharedRuntime::_implicit_div0_throws = 0;
 
@@ -195,18 +256,18 @@ void SharedRuntime::trace_ic_miss(address at) {
   _ICmiss_count[index] = 1;
 }
 
-void SharedRuntime::print_ic_miss_histogram() {
+void SharedRuntime::print_ic_miss_histogram_on(outputStream* st) {
   if (ICMissHistogram) {
-    tty->print_cr("IC Miss Histogram:");
+    st->print_cr("IC Miss Histogram:");
     int tot_misses = 0;
     for (int i = 0; i < _ICmiss_index; i++) {
-      tty->print_cr("  at: " INTPTR_FORMAT "  nof: %d", p2i(_ICmiss_at[i]), _ICmiss_count[i]);
+      st->print_cr("  at: " INTPTR_FORMAT "  nof: %d", p2i(_ICmiss_at[i]), _ICmiss_count[i]);
       tot_misses += _ICmiss_count[i];
     }
-    tty->print_cr("Total IC misses: %7d", tot_misses);
+    st->print_cr("Total IC misses: %7d", tot_misses);
   }
 }
-#endif // PRODUCT
+#endif // !PRODUCT
 
 
 JRT_LEAF(jlong, SharedRuntime::lmul(jlong y, jlong x))
@@ -485,7 +546,7 @@ address SharedRuntime::raw_exception_handler_for_return_address(JavaThread* curr
 
   // The fastest case first
   CodeBlob* blob = CodeCache::find_blob(return_address);
-  CompiledMethod* nm = (blob != nullptr) ? blob->as_compiled_method_or_null() : nullptr;
+  nmethod* nm = (blob != nullptr) ? blob->as_nmethod_or_null() : nullptr;
   if (nm != nullptr) {
     // Set flag if return address is a method handle call site.
     current->set_is_method_handle_return(nm->is_method_handle_return(return_address));
@@ -558,10 +619,10 @@ address SharedRuntime::get_poll_stub(address pc) {
   CodeBlob *cb = CodeCache::find_blob(pc);
 
   // Should be an nmethod
-  guarantee(cb != nullptr && cb->is_compiled(), "safepoint polling: pc must refer to an nmethod");
+  guarantee(cb != nullptr && cb->is_nmethod(), "safepoint polling: pc must refer to an nmethod");
 
   // Look up the relocation information
-  assert(((CompiledMethod*)cb)->is_at_poll_or_poll_return(pc),
+  assert(cb->as_nmethod()->is_at_poll_or_poll_return(pc),
       "safepoint polling: type must be poll at pc " INTPTR_FORMAT, p2i(pc));
 
 #ifdef ASSERT
@@ -572,8 +633,8 @@ address SharedRuntime::get_poll_stub(address pc) {
   }
 #endif
 
-  bool at_poll_return = ((CompiledMethod*)cb)->is_at_poll_return(pc);
-  bool has_wide_vectors = ((CompiledMethod*)cb)->has_wide_vectors();
+  bool at_poll_return = cb->as_nmethod()->is_at_poll_return(pc);
+  bool has_wide_vectors = cb->as_nmethod()->has_wide_vectors();
   if (at_poll_return) {
     assert(SharedRuntime::polling_page_return_handler_blob() != nullptr,
            "polling page return stub not created yet");
@@ -677,32 +738,43 @@ JRT_LEAF(int, SharedRuntime::rc_trace_method_entry(
     ResourceMark rm;
     log_trace(redefine, class, obsolete)("calling obsolete method '%s'", method->name_and_sig_as_C_string());
   }
+
+  LogStreamHandle(Trace, interpreter, bytecode) log;
+  if (log.is_enabled()) {
+    ResourceMark rm;
+    log.print("method entry: " INTPTR_FORMAT " %s %s%s%s%s",
+              p2i(thread),
+              (method->is_static() ? "static" : "virtual"),
+              method->name_and_sig_as_C_string(),
+              (method->is_native() ? " native" : ""),
+              (thread->class_being_initialized() != nullptr ? " clinit" : ""),
+              (method->method_holder()->is_initialized() ? "" : " being_initialized"));
+  }
   return 0;
 JRT_END
 
 // ret_pc points into caller; we are returning caller's exception handler
 // for given exception
 // Note that the implementation of this method assumes it's only called when an exception has actually occured
-address SharedRuntime::compute_compiled_exc_handler(CompiledMethod* cm, address ret_pc, Handle& exception,
+address SharedRuntime::compute_compiled_exc_handler(nmethod* nm, address ret_pc, Handle& exception,
                                                     bool force_unwind, bool top_frame_only, bool& recursive_exception_occurred) {
-  assert(cm != nullptr, "must exist");
+  assert(nm != nullptr, "must exist");
   ResourceMark rm;
 
 #if INCLUDE_JVMCI
-  if (cm->is_compiled_by_jvmci()) {
+  if (nm->is_compiled_by_jvmci()) {
     // lookup exception handler for this pc
-    int catch_pco = pointer_delta_as_int(ret_pc, cm->code_begin());
-    ExceptionHandlerTable table(cm);
+    int catch_pco = pointer_delta_as_int(ret_pc, nm->code_begin());
+    ExceptionHandlerTable table(nm);
     HandlerTableEntry *t = table.entry_for(catch_pco, -1, 0);
     if (t != nullptr) {
-      return cm->code_begin() + t->pco();
+      return nm->code_begin() + t->pco();
     } else {
-      return Deoptimization::deoptimize_for_missing_exception_handler(cm);
+      return Deoptimization::deoptimize_for_missing_exception_handler(nm);
     }
   }
 #endif // INCLUDE_JVMCI
 
-  nmethod* nm = cm->as_nmethod();
   ScopeDesc* sd = nm->scope_desc_at(ret_pc);
   // determine handler bci, if any
   EXCEPTION_MARK;
@@ -913,7 +985,7 @@ address SharedRuntime::continuation_for_implicit_exception(JavaThread* current,
           // 2. Inline-cache check in nmethod, or
           // 3. Implicit null exception in nmethod
 
-          if (!cb->is_compiled()) {
+          if (!cb->is_nmethod()) {
             bool is_in_blob = cb->is_adapter_blob() || cb->is_method_handles_adapter_blob();
             if (!is_in_blob) {
               // Allow normal crash reporting to handle this
@@ -925,8 +997,8 @@ address SharedRuntime::continuation_for_implicit_exception(JavaThread* current,
           }
 
           // Otherwise, it's a compiled method.  Consult its exception handlers.
-          CompiledMethod* cm = (CompiledMethod*)cb;
-          if (cm->inlinecache_check_contains(pc)) {
+          nmethod* nm = cb->as_nmethod();
+          if (nm->inlinecache_check_contains(pc)) {
             // exception happened inside inline-cache check code
             // => the nmethod is not yet active (i.e., the frame
             // is not set up yet) => use return address pushed by
@@ -935,7 +1007,7 @@ address SharedRuntime::continuation_for_implicit_exception(JavaThread* current,
             return StubRoutines::throw_NullPointerException_at_call_entry();
           }
 
-          if (cm->method()->is_method_handle_intrinsic()) {
+          if (nm->method()->is_method_handle_intrinsic()) {
             // exception happened inside MH dispatch code, similar to a vtable stub
             Events::log_exception(current, "NullPointerException in MH adapter " INTPTR_FORMAT, p2i(pc));
             return StubRoutines::throw_NullPointerException_at_call_entry();
@@ -944,7 +1016,7 @@ address SharedRuntime::continuation_for_implicit_exception(JavaThread* current,
 #ifndef PRODUCT
           _implicit_null_throws++;
 #endif
-          target_pc = cm->continuation_for_implicit_null_exception(pc);
+          target_pc = nm->continuation_for_implicit_null_exception(pc);
           // If there's an unexpected fault, target_pc might be null,
           // in which case we want to fall through into the normal
           // error handling code.
@@ -955,12 +1027,12 @@ address SharedRuntime::continuation_for_implicit_exception(JavaThread* current,
 
 
       case IMPLICIT_DIVIDE_BY_ZERO: {
-        CompiledMethod* cm = CodeCache::find_compiled(pc);
-        guarantee(cm != nullptr, "must have containing compiled method for implicit division-by-zero exceptions");
+        nmethod* nm = CodeCache::find_nmethod(pc);
+        guarantee(nm != nullptr, "must have containing compiled method for implicit division-by-zero exceptions");
 #ifndef PRODUCT
         _implicit_div0_throws++;
 #endif
-        target_pc = cm->continuation_for_implicit_div0_exception(pc);
+        target_pc = nm->continuation_for_implicit_div0_exception(pc);
         // If there's an unexpected fault, target_pc might be null,
         // in which case we want to fall through into the normal
         // error handling code.
@@ -1109,7 +1181,7 @@ Handle SharedRuntime::find_callee_info(Bytecodes::Code& bc, CallInfo& callinfo, 
 }
 
 Method* SharedRuntime::extract_attached_method(vframeStream& vfst) {
-  CompiledMethod* caller = vfst.nm();
+  nmethod* caller = vfst.nm();
 
   address pc = vfst.frame_pc();
   { // Get call instruction under lock because another thread may be busy patching it.
@@ -1295,8 +1367,8 @@ methodHandle SharedRuntime::resolve_helper(bool is_virtual, bool is_optimized, T
   frame caller_frame = current->last_frame().sender(&cbl_map);
 
   CodeBlob* caller_cb = caller_frame.cb();
-  guarantee(caller_cb != nullptr && caller_cb->is_compiled(), "must be called from compiled method");
-  CompiledMethod* caller_nm = caller_cb->as_compiled_method();
+  guarantee(caller_cb != nullptr && caller_cb->is_nmethod(), "must be called from compiled method");
+  nmethod* caller_nm = caller_cb->as_nmethod();
 
   // determine call info & receiver
   // note: a) receiver is null for static calls
@@ -1317,13 +1389,13 @@ methodHandle SharedRuntime::resolve_helper(bool is_virtual, bool is_optimized, T
 
   assert(!caller_nm->is_unloading(), "It should not be unloading");
 
-#ifndef PRODUCT
   // tracing/debugging/statistics
   uint *addr = (is_optimized) ? (&_resolve_opt_virtual_ctr) :
                  (is_virtual) ? (&_resolve_virtual_ctr) :
                                 (&_resolve_static_ctr);
   Atomic::inc(addr);
 
+#ifndef PRODUCT
   if (TraceCallFixup) {
     ResourceMark rm(current);
     tty->print("resolving %s%s (%s) call to",
@@ -1379,6 +1451,8 @@ methodHandle SharedRuntime::resolve_helper(bool is_virtual, bool is_optimized, T
 
 // Inline caches exist only in compiled code
 JRT_BLOCK_ENTRY(address, SharedRuntime::handle_wrong_method_ic_miss(JavaThread* current))
+  PerfTraceTime timer(_perf_ic_miss_total_time);
+
 #ifdef ASSERT
   RegisterMap reg_map(current,
                       RegisterMap::UpdateMap::skip,
@@ -1404,6 +1478,8 @@ JRT_END
 
 // Handle call site that has been made non-entrant
 JRT_BLOCK_ENTRY(address, SharedRuntime::handle_wrong_method(JavaThread* current))
+  PerfTraceTime timer(_perf_handle_wrong_method_total_time);
+
   // 6243940 We might end up in here if the callee is deoptimized
   // as we race to call it.  We don't want to take a safepoint if
   // the caller was interpreted because the caller frame will look
@@ -1457,6 +1533,8 @@ JRT_END
 
 // Handle abstract method call
 JRT_BLOCK_ENTRY(address, SharedRuntime::handle_wrong_method_abstract(JavaThread* current))
+  PerfTraceTime timer(_perf_handle_wrong_method_total_time);
+
   // Verbose error message for AbstractMethodError.
   // Get the called method from the invoke bytecode.
   vframeStream vfst(current, true);
@@ -1492,6 +1570,8 @@ JRT_END
 
 // resolve a static call and patch code
 JRT_BLOCK_ENTRY(address, SharedRuntime::resolve_static_call_C(JavaThread* current ))
+  PerfTraceTime timer(_perf_resolve_static_total_time);
+
   methodHandle callee_method;
   bool enter_special = false;
   JRT_BLOCK
@@ -1506,8 +1586,8 @@ JRT_BLOCK_ENTRY(address, SharedRuntime::resolve_static_call_C(JavaThread* curren
       frame stub_frame = current->last_frame();
       assert(stub_frame.is_runtime_frame(), "must be a runtimeStub");
       frame caller = stub_frame.sender(&reg_map);
-      enter_special = caller.cb() != nullptr && caller.cb()->is_compiled()
-        && caller.cb()->as_compiled_method()->method()->is_continuation_enter_intrinsic();
+      enter_special = caller.cb() != nullptr && caller.cb()->is_nmethod()
+        && caller.cb()->as_nmethod()->method()->is_continuation_enter_intrinsic();
     }
   JRT_BLOCK_END
 
@@ -1530,6 +1610,8 @@ JRT_END
 
 // resolve virtual call and update inline cache to monomorphic
 JRT_BLOCK_ENTRY(address, SharedRuntime::resolve_virtual_call_C(JavaThread* current))
+  PerfTraceTime timer(_perf_resolve_virtual_total_time);
+
   methodHandle callee_method;
   JRT_BLOCK
     callee_method = SharedRuntime::resolve_helper(true, false, CHECK_NULL);
@@ -1544,6 +1626,8 @@ JRT_END
 // Resolve a virtual call that can be statically bound (e.g., always
 // monomorphic, so it has no inline cache).  Patch code to resolved target.
 JRT_BLOCK_ENTRY(address, SharedRuntime::resolve_opt_virtual_call_C(JavaThread* current))
+  PerfTraceTime timer(_perf_resolve_opt_virtual_total_time);
+
   methodHandle callee_method;
   JRT_BLOCK
     callee_method = SharedRuntime::resolve_helper(true, true, CHECK_NULL);
@@ -1566,9 +1650,9 @@ methodHandle SharedRuntime::handle_ic_miss_helper(TRAPS) {
 
   methodHandle callee_method(current, call_info.selected_method());
 
-#ifndef PRODUCT
   Atomic::inc(&_ic_miss_ctr);
 
+#ifndef PRODUCT
   // Statistics & Tracing
   if (TraceCallFixup) {
     ResourceMark rm(current);
@@ -1603,7 +1687,7 @@ methodHandle SharedRuntime::handle_ic_miss_helper(TRAPS) {
                       RegisterMap::WalkContinuation::skip);
   frame caller_frame = current->last_frame().sender(&reg_map);
   CodeBlob* cb = caller_frame.cb();
-  CompiledMethod* caller_nm = cb->as_compiled_method();
+  nmethod* caller_nm = cb->as_nmethod();
 
   CompiledICLocker ml(caller_nm);
   CompiledIC* inline_cache = CompiledIC_before(caller_nm, caller_frame.pc());
@@ -1634,11 +1718,11 @@ methodHandle SharedRuntime::reresolve_call_site(TRAPS) {
   // so no update to the caller is needed.
 
   if ((caller.is_compiled_frame() && !caller.is_deoptimized_frame()) ||
-      (caller.is_native_frame() && ((CompiledMethod*)caller.cb())->method()->is_continuation_enter_intrinsic())) {
+      (caller.is_native_frame() && caller.cb()->as_nmethod()->method()->is_continuation_enter_intrinsic())) {
 
     address pc = caller.pc();
 
-    CompiledMethod* caller_nm = CodeCache::find_compiled(pc);
+    nmethod* caller_nm = CodeCache::find_nmethod(pc);
 
     // Default call_addr is the location of the "basic" call.
     // Determine the address of the call we a reresolving. With
@@ -1690,10 +1774,9 @@ methodHandle SharedRuntime::reresolve_call_site(TRAPS) {
 
   methodHandle callee_method = find_callee_method(CHECK_(methodHandle()));
 
-
-#ifndef PRODUCT
   Atomic::inc(&_wrong_method_ctr);
 
+#ifndef PRODUCT
   if (TraceCallFixup) {
     ResourceMark rm(current);
     tty->print("handle_wrong_method reresolving call to");
@@ -1766,7 +1849,7 @@ JRT_LEAF(void, SharedRuntime::fixup_callers_callsite(Method* method, address cal
   // Result from nmethod::is_unloading is not stable across safepoints.
   NoSafepointVerifier nsv;
 
-  CompiledMethod* callee = method->code();
+  nmethod* callee = method->code();
   if (callee == nullptr) {
     return;
   }
@@ -1775,12 +1858,12 @@ JRT_LEAF(void, SharedRuntime::fixup_callers_callsite(Method* method, address cal
   MACOS_AARCH64_ONLY(ThreadWXEnable __wx(WXWrite, JavaThread::current()));
 
   CodeBlob* cb = CodeCache::find_blob(caller_pc);
-  if (cb == nullptr || !cb->is_compiled() || !callee->is_in_use() || callee->is_unloading()) {
+  if (cb == nullptr || !cb->is_nmethod() || !callee->is_in_use() || callee->is_unloading()) {
     return;
   }
 
-  // The check above makes sure this is a nmethod.
-  CompiledMethod* caller = cb->as_compiled_method();
+  // The check above makes sure this is an nmethod.
+  nmethod* caller = cb->as_nmethod();
 
   // Get the return PC for the passed caller PC.
   address return_pc = caller_pc + frame::pc_return_offset;
@@ -1956,43 +2039,45 @@ void SharedRuntime::print_statistics() {
   ttyLocker ttyl;
   if (xtty != nullptr)  xtty->head("statistics type='SharedRuntime'");
 
-  SharedRuntime::print_ic_miss_histogram();
-
-  // Dump the JRT_ENTRY counters
-  if (_new_instance_ctr) tty->print_cr("%5u new instance requires GC", _new_instance_ctr);
-  if (_new_array_ctr) tty->print_cr("%5u new array requires GC", _new_array_ctr);
-  if (_multi2_ctr) tty->print_cr("%5u multianewarray 2 dim", _multi2_ctr);
-  if (_multi3_ctr) tty->print_cr("%5u multianewarray 3 dim", _multi3_ctr);
-  if (_multi4_ctr) tty->print_cr("%5u multianewarray 4 dim", _multi4_ctr);
-  if (_multi5_ctr) tty->print_cr("%5u multianewarray 5 dim", _multi5_ctr);
-
-  tty->print_cr("%5u inline cache miss in compiled", _ic_miss_ctr);
-  tty->print_cr("%5u wrong method", _wrong_method_ctr);
-  tty->print_cr("%5u unresolved static call site", _resolve_static_ctr);
-  tty->print_cr("%5u unresolved virtual call site", _resolve_virtual_ctr);
-  tty->print_cr("%5u unresolved opt virtual call site", _resolve_opt_virtual_ctr);
-
-  if (_mon_enter_stub_ctr) tty->print_cr("%5u monitor enter stub", _mon_enter_stub_ctr);
-  if (_mon_exit_stub_ctr) tty->print_cr("%5u monitor exit stub", _mon_exit_stub_ctr);
-  if (_mon_enter_ctr) tty->print_cr("%5u monitor enter slow", _mon_enter_ctr);
-  if (_mon_exit_ctr) tty->print_cr("%5u monitor exit slow", _mon_exit_ctr);
-  if (_partial_subtype_ctr) tty->print_cr("%5u slow partial subtype", _partial_subtype_ctr);
-  if (_jbyte_array_copy_ctr) tty->print_cr("%5u byte array copies", _jbyte_array_copy_ctr);
-  if (_jshort_array_copy_ctr) tty->print_cr("%5u short array copies", _jshort_array_copy_ctr);
-  if (_jint_array_copy_ctr) tty->print_cr("%5u int array copies", _jint_array_copy_ctr);
-  if (_jlong_array_copy_ctr) tty->print_cr("%5u long array copies", _jlong_array_copy_ctr);
-  if (_oop_array_copy_ctr) tty->print_cr("%5u oop array copies", _oop_array_copy_ctr);
-  if (_checkcast_array_copy_ctr) tty->print_cr("%5u checkcast array copies", _checkcast_array_copy_ctr);
-  if (_unsafe_array_copy_ctr) tty->print_cr("%5u unsafe array copies", _unsafe_array_copy_ctr);
-  if (_generic_array_copy_ctr) tty->print_cr("%5u generic array copies", _generic_array_copy_ctr);
-  if (_slow_array_copy_ctr) tty->print_cr("%5u slow array copies", _slow_array_copy_ctr);
-  if (_find_handler_ctr) tty->print_cr("%5u find exception handler", _find_handler_ctr);
-  if (_rethrow_ctr) tty->print_cr("%5u rethrow handler", _rethrow_ctr);
-
-  AdapterHandlerLibrary::print_statistics();
+  SharedRuntime::print_ic_miss_histogram_on(tty);
+  SharedRuntime::print_counters_on(tty);
+  AdapterHandlerLibrary::print_statistics_on(tty);
 
   if (xtty != nullptr)  xtty->tail("statistics");
 }
+
+//void SharedRuntime::print_counters_on(outputStream* st) {
+//  // Dump the JRT_ENTRY counters
+//  if (_new_instance_ctr) st->print_cr("%5u new instance requires GC", _new_instance_ctr);
+//  if (_new_array_ctr)    st->print_cr("%5u new array requires GC", _new_array_ctr);
+//  if (_multi2_ctr)       st->print_cr("%5u multianewarray 2 dim", _multi2_ctr);
+//  if (_multi3_ctr)       st->print_cr("%5u multianewarray 3 dim", _multi3_ctr);
+//  if (_multi4_ctr)       st->print_cr("%5u multianewarray 4 dim", _multi4_ctr);
+//  if (_multi5_ctr)       st->print_cr("%5u multianewarray 5 dim", _multi5_ctr);
+//
+//  st->print_cr("%5u inline cache miss in compiled", _ic_miss_ctr);
+//  st->print_cr("%5u wrong method", _wrong_method_ctr);
+//  st->print_cr("%5u unresolved static call site", _resolve_static_ctr);
+//  st->print_cr("%5u unresolved virtual call site", _resolve_virtual_ctr);
+//  st->print_cr("%5u unresolved opt virtual call site", _resolve_opt_virtual_ctr);
+//
+//  if (_mon_enter_stub_ctr)       st->print_cr("%5u monitor enter stub", _mon_enter_stub_ctr);
+//  if (_mon_exit_stub_ctr)        st->print_cr("%5u monitor exit stub", _mon_exit_stub_ctr);
+//  if (_mon_enter_ctr)            st->print_cr("%5u monitor enter slow", _mon_enter_ctr);
+//  if (_mon_exit_ctr)             st->print_cr("%5u monitor exit slow", _mon_exit_ctr);
+//  if (_partial_subtype_ctr)      st->print_cr("%5u slow partial subtype", _partial_subtype_ctr);
+//  if (_jbyte_array_copy_ctr)     st->print_cr("%5u byte array copies", _jbyte_array_copy_ctr);
+//  if (_jshort_array_copy_ctr)    st->print_cr("%5u short array copies", _jshort_array_copy_ctr);
+//  if (_jint_array_copy_ctr)      st->print_cr("%5u int array copies", _jint_array_copy_ctr);
+//  if (_jlong_array_copy_ctr)     st->print_cr("%5u long array copies", _jlong_array_copy_ctr);
+//  if (_oop_array_copy_ctr)       st->print_cr("%5u oop array copies", _oop_array_copy_ctr);
+//  if (_checkcast_array_copy_ctr) st->print_cr("%5u checkcast array copies", _checkcast_array_copy_ctr);
+//  if (_unsafe_array_copy_ctr)    st->print_cr("%5u unsafe array copies", _unsafe_array_copy_ctr);
+//  if (_generic_array_copy_ctr)   st->print_cr("%5u generic array copies", _generic_array_copy_ctr);
+//  if (_slow_array_copy_ctr)      st->print_cr("%5u slow array copies", _slow_array_copy_ctr);
+//  if (_find_handler_ctr)         st->print_cr("%5u find exception handler", _find_handler_ctr);
+//  if (_rethrow_ctr)              st->print_cr("%5u rethrow handler", _rethrow_ctr);
+//}
 
 inline double percent(int64_t x, int64_t y) {
   return 100.0 * (double)x / (double)MAX2(y, (int64_t)1);
@@ -2078,7 +2163,7 @@ uint64_t MethodArityHistogram::_max_compiled_calls_per_method;
 int MethodArityHistogram::_max_arity;
 int MethodArityHistogram::_max_size;
 
-void SharedRuntime::print_call_statistics(uint64_t comp_total) {
+void SharedRuntime::print_call_statistics_on(outputStream* st) {
   tty->print_cr("Calls from compiled code:");
   int64_t total  = _nof_normal_calls + _nof_interface_calls + _nof_static_calls;
   int64_t mono_c = _nof_normal_calls - _nof_megamorphic_calls;
@@ -2331,18 +2416,18 @@ static AdapterHandlerEntry* lookup(int total_args_passed, BasicType* sig_bt) {
 }
 
 #ifndef PRODUCT
-static void print_table_statistics() {
+void AdapterHandlerLibrary::print_statistics_on(outputStream* st) {
   auto size = [&] (AdapterFingerPrint* key, AdapterHandlerEntry* a) {
     return sizeof(*key) + sizeof(*a);
   };
   TableStatistics ts = _adapter_handler_table->statistics_calculate(size);
-  ts.print(tty, "AdapterHandlerTable");
-  tty->print_cr("AdapterHandlerTable (table_size=%d, entries=%d)",
-                _adapter_handler_table->table_size(), _adapter_handler_table->number_of_entries());
-  tty->print_cr("AdapterHandlerTable: lookups %d equals %d hits %d compact %d",
-                _lookups, _equals, _hits, _compact);
+  ts.print(st, "AdapterHandlerTable");
+  st->print_cr("AdapterHandlerTable (table_size=%d, entries=%d)",
+               _adapter_handler_table->table_size(), _adapter_handler_table->number_of_entries());
+  st->print_cr("AdapterHandlerTable: lookups %d equals %d hits %d compact %d",
+               _lookups, _equals, _hits, _compact);
 }
-#endif
+#endif // !PRODUCT
 
 // ---------------------------------------------------------------------------
 // Implementation of AdapterHandlerLibrary
@@ -2576,6 +2661,9 @@ AdapterHandlerEntry* AdapterHandlerLibrary::create_adapter(AdapterBlob*& new_ada
                                                            int total_args_passed,
                                                            BasicType* sig_bt,
                                                            bool allocate_code_blob) {
+  if (UsePerfData) {
+    ClassLoader::perf_method_adapters_count()->inc();
+  }
 
   // StubRoutines::_final_stubs_code is initialized after this function can be called. As a result,
   // VerifyAdapterCalls and VerifyAdapterSharing can fail if we re-use code that generated prior
@@ -3025,14 +3113,6 @@ void AdapterHandlerEntry::print_adapter_on(outputStream* st) const {
   st->cr();
 }
 
-#ifndef PRODUCT
-
-void AdapterHandlerLibrary::print_statistics() {
-  print_table_statistics();
-}
-
-#endif /* PRODUCT */
-
 JRT_LEAF(void, SharedRuntime::enable_stack_reserved_zone(JavaThread* current))
   assert(current == JavaThread::current(), "pre-condition");
   StackOverflow* overflow_state = current->stack_overflow_state();
@@ -3043,7 +3123,7 @@ JRT_END
 frame SharedRuntime::look_for_reserved_stack_annotated_method(JavaThread* current, frame fr) {
   ResourceMark rm(current);
   frame activation;
-  CompiledMethod* nm = nullptr;
+  nmethod* nm = nullptr;
   int count = 1;
 
   assert(fr.is_java_frame(), "Must start on Java frame");
@@ -3066,8 +3146,8 @@ frame SharedRuntime::look_for_reserved_stack_annotated_method(JavaThread* curren
       }
     } else {
       CodeBlob* cb = fr.cb();
-      if (cb != nullptr && cb->is_compiled()) {
-        nm = cb->as_compiled_method();
+      if (cb != nullptr && cb->is_nmethod()) {
+        nm = cb->as_nmethod();
         method = nm->method();
         // scope_desc_near() must be used, instead of scope_desc_at() because on
         // SPARC, the pcDesc can be on the delay slot after the call instruction.

@@ -1135,7 +1135,7 @@ class CallStubImpl {
  public:
   // Size of call trampoline stub.
   static uint size_call_trampoline() {
-    return 0; // no call trampolines on this platform
+    return MacroAssembler::max_trampoline_stub_size(); // no call trampolines on this platform
   }
 
   // number of relocations needed by a call trampoline stub
@@ -3428,7 +3428,7 @@ encode %{
       } else if (rtype == relocInfo::metadata_type) {
         __ mov_metadata(dst_reg, (Metadata*)con);
       } else {
-        assert(rtype == relocInfo::none, "unexpected reloc type");
+        assert(rtype == relocInfo::none || rtype == relocInfo::external_word_type, "unexpected reloc type");
         if (! __ is_valid_AArch64_address(con) ||
             con < (address)(uintptr_t)os::vm_page_size()) {
           __ mov(dst_reg, con);

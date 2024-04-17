@@ -23,7 +23,8 @@
  */
 
 #include "precompiled.hpp"
-#include "resolvedFieldEntry.hpp"
+#include "cds/archiveBuilder.hpp"
+#include "oops/resolvedFieldEntry.hpp"
 
 void ResolvedFieldEntry::print_on(outputStream* st) const {
   st->print_cr("Field Entry:");
@@ -47,4 +48,8 @@ void ResolvedFieldEntry::remove_unshareable_info() {
   u2 saved_cpool_index = _cpool_index;
   memset(this, 0, sizeof(*this));
   _cpool_index = saved_cpool_index;
+}
+
+void ResolvedFieldEntry::mark_and_relocate() {
+  ArchiveBuilder::current()->mark_and_relocate_to_buffered_addr(&_field_holder);
 }

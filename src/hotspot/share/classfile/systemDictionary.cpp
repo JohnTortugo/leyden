@@ -24,6 +24,7 @@
 
 #include "precompiled.hpp"
 #include "cds/cdsConfig.hpp"
+#include "cds/classPreloader.hpp"
 #include "cds/heapShared.hpp"
 #include "classfile/classFileParser.hpp"
 #include "classfile/classFileStream.hpp"
@@ -36,6 +37,7 @@
 #include "classfile/javaClasses.inline.hpp"
 #include "classfile/klassFactory.hpp"
 #include "classfile/loaderConstraints.hpp"
+#include "classfile/modules.hpp"
 #include "classfile/packageEntry.hpp"
 #include "classfile/placeholders.hpp"
 #include "classfile/protectionDomainCache.hpp"
@@ -82,6 +84,7 @@
 #include "services/diagnosticCommand.hpp"
 #include "services/finalizerService.hpp"
 #include "services/threadService.hpp"
+#include "utilities/growableArray.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/utf8.hpp"
 #if INCLUDE_CDS
@@ -134,22 +137,10 @@ oop SystemDictionary::java_platform_loader() {
 }
 
 void SystemDictionary::compute_java_loaders(TRAPS) {
-  if (_java_system_loader.is_empty()) {
-    oop system_loader = get_system_class_loader_impl(CHECK);
-    _java_system_loader = OopHandle(Universe::vm_global(), system_loader);
-  } else {
-    // It must have been restored from the archived module graph
-    assert(UseSharedSpaces, "must be");
-    assert(CDSConfig::is_using_full_module_graph(), "must be");
-    DEBUG_ONLY(
-      oop system_loader = get_system_class_loader_impl(CHECK);
-      assert(_java_system_loader.resolve() == system_loader, "must be");
-    )
- }
-
   if (_java_platform_loader.is_empty()) {
     oop platform_loader = get_platform_class_loader_impl(CHECK);
     _java_platform_loader = OopHandle(Universe::vm_global(), platform_loader);
+    ClassPreloader::runtime_preload(THREAD, Handle(THREAD, java_platform_loader()));
   } else {
     // It must have been restored from the archived module graph
     assert(UseSharedSpaces, "must be");
@@ -157,6 +148,20 @@ void SystemDictionary::compute_java_loaders(TRAPS) {
     DEBUG_ONLY(
       oop platform_loader = get_platform_class_loader_impl(CHECK);
       assert(_java_platform_loader.resolve() == platform_loader, "must be");
+    )
+  }
+
+  if (_java_system_loader.is_empty()) {
+    oop system_loader = get_system_class_loader_impl(CHECK);
+    _java_system_loader = OopHandle(Universe::vm_global(), system_loader);
+    ClassPreloader::runtime_preload(THREAD, Handle(THREAD, java_system_loader()));
+  } else {
+    // It must have been restored from the archived module graph
+    assert(UseSharedSpaces, "must be");
+    assert(CDSConfig::is_using_full_module_graph(), "must be");
+    DEBUG_ONLY(
+      oop system_loader = get_system_class_loader_impl(CHECK);
+      assert(_java_system_loader.resolve() == system_loader, "must be");
     )
   }
 }
@@ -1009,7 +1014,11 @@ bool SystemDictionary::is_shared_class_visible_impl(Symbol* class_name,
   bool was_archived_from_named_module = scp_entry->in_named_module();
   bool visible;
 
-  if (was_archived_from_named_module) {
+  if (mod_entry != nullptr && mod_entry->location() == nullptr && mod_entry->is_named()) {
+    // Archived module for dynamic proxies. It's always visible.
+    assert(Modules::is_dynamic_proxy_module(mod_entry), "must be");
+    visible = true;
+  } else if (was_archived_from_named_module) {
     if (should_be_in_named_module) {
       // Is the module loaded from the same location as during dump time?
       visible = mod_entry->shared_path_index() == scp_index;
@@ -1185,11 +1194,28 @@ void SystemDictionary::load_shared_class_misc(InstanceKlass* ik, ClassLoaderData
   // package was loaded.
   if (loader_data->is_the_null_class_loader_data()) {
     s2 path_index = ik->shared_classpath_index();
-    ik->set_classpath_index(path_index);
+    if (path_index >= 0) { // FIXME ... for lambda form classes
+      ik->set_classpath_index(path_index);
+
+      if (CDSConfig::is_dumping_final_static_archive()) {
+        if (path_index > ClassLoaderExt::max_used_path_index()) {
+          ClassLoaderExt::set_max_used_path_index(path_index);
+        }
+      }
+    }
   }
 
   // notify a class loaded from shared object
   ClassLoadingService::notify_class_loaded(ik, true /* shared class */);
+
+  if (CDSConfig::is_dumping_final_static_archive()) {
+    SystemDictionaryShared::init_dumptime_info(ik);
+    if (SystemDictionary::is_platform_class_loader(loader_data->class_loader())) {
+      ClassLoaderExt::set_has_platform_classes();
+    } else if (SystemDictionary::is_system_class_loader(loader_data->class_loader())) {
+      ClassLoaderExt::set_has_app_classes();
+    }
+  }
 }
 
 #endif // INCLUDE_CDS
@@ -1264,7 +1290,7 @@ InstanceKlass* SystemDictionary::load_instance_class_impl(Symbol* class_name, Ha
 #if INCLUDE_CDS
     if (UseSharedSpaces)
     {
-      PerfTraceTime vmtimer(ClassLoader::perf_shared_classload_time());
+      PerfTraceElapsedTime vmtimer(ClassLoader::perf_shared_classload_time());
       InstanceKlass* ik = SystemDictionaryShared::find_builtin_class(class_name);
       if (ik != nullptr && ik->is_shared_boot_class() && !ik->shared_loading_failed()) {
         SharedClassLoadingMark slm(THREAD, ik);
@@ -1275,7 +1301,7 @@ InstanceKlass* SystemDictionary::load_instance_class_impl(Symbol* class_name, Ha
 
     if (k == nullptr) {
       // Use VM class loader
-      PerfTraceTime vmtimer(ClassLoader::perf_sys_classload_time());
+      PerfTraceElapsedTime vmtimer(ClassLoader::perf_sys_classload_time());
       k = ClassLoader::load_class(class_name, pkg_entry, search_only_bootloader_append, CHECK_NULL);
     }
 
@@ -1702,6 +1728,17 @@ void SystemDictionary::update_dictionary(JavaThread* current,
   mu1.notify_all();
 }
 
+#if INCLUDE_CDS
+void SystemDictionary::preload_class(JavaThread* current,
+                                     InstanceKlass* k,
+                                     ClassLoaderData* loader_data) {
+  assert_locked_or_safepoint(SystemDictionary_lock);
+  Symbol* name  = k->name();
+  Dictionary* dictionary = loader_data->dictionary();
+  assert(dictionary->find_class(current, name) == nullptr, "sanity");
+  dictionary->add_klass(current, name, k);
+}
+#endif
 
 // Try to find a class name using the loader constraints.  The
 // loader constraints might know about a class that isn't fully loaded
@@ -2015,6 +2052,46 @@ Method* SystemDictionary::find_method_handle_intrinsic(vmIntrinsicID iid,
   }
   return nullptr;
 }
+
+#if INCLUDE_CDS
+void SystemDictionary::get_all_method_handle_intrinsics(GrowableArray<Method*>* methods) {
+  auto do_method = [&] (InvokeMethodKey& key, Method*& m) {
+    methods->append(m);
+  };
+  _invoke_method_intrinsic_table->iterate_all(do_method);
+}
+
+void SystemDictionary::restore_archived_method_handle_intrinsics() {
+  if (UseSharedSpaces) {
+    EXCEPTION_MARK;
+    restore_archived_method_handle_intrinsics_impl(THREAD);
+    if (HAS_PENDING_EXCEPTION) {
+      vm_exit_during_initialization(err_msg("Failed to restore archived method handle intrinsics"));
+    }
+  }
+}
+
+void SystemDictionary::restore_archived_method_handle_intrinsics_impl(TRAPS) {
+  Array<Method*>* list = MetaspaceShared::archived_method_handle_intrinsics();
+  for (int i = 0; i < list->length(); i++) {
+    methodHandle m(THREAD, list->at(i));
+    Method::restore_archived_method_handle_intrinsic(m, CHECK);
+    m->constants()->restore_unshareable_info(CHECK);
+    if (!Arguments::is_interpreter_only() || m->intrinsic_id() == vmIntrinsics::_linkToNative) {
+      AdapterHandlerLibrary::create_native_wrapper(m);
+      if (!m->has_compiled_code()) {
+        ResourceMark rm(THREAD);
+        vm_exit_during_initialization(err_msg("Failed to initialize method %s", m->external_name()));
+      }
+    }
+
+    const int iid_as_int = vmIntrinsics::as_int(m->intrinsic_id());
+    InvokeMethodKey key(m->signature(), iid_as_int);
+    bool created = _invoke_method_intrinsic_table->put(key, m());
+    assert(created, "must be");
+  }
+}
+#endif
 
 // Helper for unpacking the return value from linkMethod and linkCallSite.
 static Method* unpack_method_and_appendix(Handle mname,

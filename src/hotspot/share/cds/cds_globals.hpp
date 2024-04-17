@@ -76,7 +76,7 @@
           "the CDS archive, in the specified file")                         \
                                                                             \
   product(ccstr, SharedClassListFile, nullptr,                              \
-          "Override the default CDS class list")                            \
+          "Override the default CDS class list")  \
                                                                             \
   product(ccstr, SharedArchiveFile, nullptr,                                \
           "Override the default location of the CDS archive file")          \
@@ -87,13 +87,70 @@
   product(ccstr, ExtraSharedClassListFile, nullptr,                         \
           "Extra classlist for building the CDS archive file")              \
                                                                             \
-  product(int, ArchiveRelocationMode, 1, DIAGNOSTIC,                        \
+  /*FIXME - AOT code has direct pointers to metadata that's not relocated*/ \
+  product(int, ArchiveRelocationMode, 0, DIAGNOSTIC,                        \
            "(0) first map at preferred address, and if "                    \
            "unsuccessful, map at alternative address; "                     \
            "(1) always map at alternative address (default); "              \
            "(2) always map at preferred address, and if unsuccessful, "     \
            "do not map the archive")                                        \
            range(0, 2)                                                      \
+                                                                            \
+  /*========== New options added by Leyden =============================*/  \
+                                                                            \
+  product(ccstr, CacheDataStore, nullptr,                                   \
+          "If valid, use the specified file for SharedArchiveFile; "        \
+          "otherwise the specified file is generated at program exit")      \
+                                                                            \
+  product(ccstr, CDSPreimage, nullptr,                                      \
+          "(** internal use only **) -- used by a child JVM process to "    \
+          "create the CacheDataStore final image")                          \
+                                                                            \
+  product(bool, CDSManualFinalImage, false, DIAGNOSTIC,                     \
+          "(** internal use only **) -- if false, automatically launch a "  \
+          "child process to create the final image.")                       \
+                                                                            \
+  /* To be renamed to CDSLoadedClasses */                                   \
+  product(bool, PreloadSharedClasses, false,                                \
+          "Load all shared classes for the boot/platform/app loaders "      \
+          "immediately at VM start-up")                                     \
+                                                                            \
+  product(bool, PrelinkSharedClasses, true,                                 \
+          "Link all shared classes for the boot/platform/app loaders "      \
+          "immediately at VM start-up")                                     \
+                                                                            \
+  product(bool, ArchiveDynamicProxies, false,                               \
+          "Archive classes generated for java/lang/reflect/Proxy")          \
+                                                                            \
+  product(bool, ArchiveFieldReferences, true,                               \
+          "Archive resolved JVM_CONSTANT_Fieldref in ConstantPool")         \
+                                                                            \
+  product(bool, ArchiveInvokeDynamic, false,                                \
+          "Archive resolved JVM_CONSTANT_InvokeDynamic in ConstantPool")    \
+                                                                            \
+  product(bool, ArchiveLoaderLookupCache, false,                            \
+          "Archive app loader's positive and negative lookup cache")        \
+                                                                            \
+  product(bool, ArchiveMethodReferences, true,                              \
+          "Archive resolved JVM_CONSTANT_Methodref and "                    \
+          "JVM_CONSTANT_InterfaceMethodref in ConstantPool")                \
+                                                                            \
+  product(bool, ArchivePackages, false,                                     \
+          "Archive the java.lang.ClassLoader::{packages,package2certs} "    \
+          "tables")                                                         \
+                                                                            \
+  product(bool, ArchiveReflectionData, false,                               \
+          "Archive Class::reflectionData field")                            \
+                                                                            \
+  product(bool, TempDisableAddJVMCIModule, false,                           \
+          "Do not add jdk.internal.vm.ci module even for -XX:+EnableJVMCI") \
+                                                                            \
+  product(bool, UsePermanentHeapObjects, false, DIAGNOSTIC,                 \
+          "Allow AOT code to access permanent archived heap objects")       \
+                                                                            \
+  product(bool, VerifyTrainingData, trueInDebug, DIAGNOSTIC,                \
+          "Verify archived training data")                                  \
+
 // end of CDS_FLAGS
 
 DECLARE_FLAGS(CDS_FLAGS)

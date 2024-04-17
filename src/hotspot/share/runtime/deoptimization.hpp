@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -57,9 +57,9 @@ class DeoptimizationScope {
   DeoptimizationScope();
   ~DeoptimizationScope();
   // Mark a method, if already marked as dependent.
-  void mark(CompiledMethod* cm, bool inc_recompile_counts = true);
+  void mark(nmethod* nm, bool inc_recompile_counts = true);
   // Record this as a dependent method.
-  void dependent(CompiledMethod* cm);
+  void dependent(nmethod* nm);
 
   // Execute the deoptimization.
   // Make the nmethods not entrant, stackwalks and patch return pcs and sets post call nops.
@@ -157,7 +157,7 @@ class Deoptimization : AllStatic {
     _action_shift = 0,
     _reason_shift = _action_shift+_action_bits,
     _debug_id_shift = _reason_shift+_reason_bits,
-    BC_CASE_LIMIT = PRODUCT_ONLY(1) NOT_PRODUCT(4) // for _deoptimization_hist
+    BC_CASE_LIMIT = 4 // for _deoptimization_hist
   };
 
   enum UnpackType {
@@ -184,7 +184,7 @@ class Deoptimization : AllStatic {
   static void deoptimize(JavaThread* thread, frame fr, DeoptReason reason = Reason_constraint);
 
 #if INCLUDE_JVMCI
-  static address deoptimize_for_missing_exception_handler(CompiledMethod* cm);
+  static address deoptimize_for_missing_exception_handler(nmethod* nm);
   static oop get_cached_box(AutoBoxObjectValue* bv, frame* fr, RegisterMap* reg_map, bool& cache_init_error, TRAPS);
 #endif
 
@@ -326,9 +326,12 @@ class Deoptimization : AllStatic {
   static void deoptimize_frame(JavaThread* thread, intptr_t* id);
 
   // Statistics
-  static void gather_statistics(DeoptReason reason, DeoptAction action,
+  static void gather_statistics(nmethod* nm, DeoptReason reason, DeoptAction action,
                                 Bytecodes::Code bc = Bytecodes::_illegal);
   static void print_statistics();
+  static void print_statistics_on(outputStream* st);
+
+  static void print_statistics_on(const char* title, int lvl, outputStream* st);
 
   // How much room to adjust the last frame's SP by, to make space for
   // the callee's interpreter frame (which expects locals to be next to
@@ -484,11 +487,14 @@ class Deoptimization : AllStatic {
   static const char* _trap_reason_name[];
   static const char* _trap_action_name[];
 
-  static juint _deoptimization_hist[Reason_LIMIT][1+Action_LIMIT][BC_CASE_LIMIT];
+  static juint _deoptimization_hist[1 + 4 + 5][Reason_LIMIT][1+Action_LIMIT][BC_CASE_LIMIT];
   // Note:  Histogram array size is 1-2 Kb.
 
  public:
   static void update_method_data_from_interpreter(MethodData* trap_mdo, int trap_bci, int reason);
+
+  static void init_counters();
+  static void print_counters_on(outputStream* st);
 };
 
 #endif // SHARE_RUNTIME_DEOPTIMIZATION_HPP

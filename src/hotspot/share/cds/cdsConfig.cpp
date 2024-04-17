@@ -25,14 +25,19 @@
 #include "precompiled.hpp"
 #include "cds/archiveHeapLoader.hpp"
 #include "cds/cdsConfig.hpp"
+#include "cds/cds_globals.hpp"
 #include "cds/classListWriter.hpp"
 #include "cds/heapShared.hpp"
+#include "cds/metaspaceShared.hpp"
 #include "classfile/classLoaderDataShared.hpp"
 #include "classfile/moduleEntry.hpp"
+#include "classfile/systemDictionaryShared.hpp"
 #include "include/jvm_io.h"
 #include "logging/log.hpp"
+#include "prims/jvmtiExport.hpp"
 #include "memory/universe.hpp"
 #include "runtime/arguments.hpp"
+#include "runtime/globals_extension.hpp"
 #include "runtime/java.hpp"
 #include "utilities/defaultStream.hpp"
 
@@ -41,6 +46,9 @@ bool CDSConfig::_is_dumping_dynamic_archive = false;
 bool CDSConfig::_is_using_optimized_module_handling = true;
 bool CDSConfig::_is_dumping_full_module_graph = true;
 bool CDSConfig::_is_using_full_module_graph = true;
+bool CDSConfig::_has_preloaded_classes = false;
+bool CDSConfig::_is_loading_invokedynamic = false;
+bool CDSConfig::_is_loading_packages = false;
 
 char* CDSConfig::_default_archive_path = nullptr;
 char* CDSConfig::_static_archive_path = nullptr;
@@ -51,12 +59,15 @@ int CDSConfig::get_status() {
   return (is_dumping_archive()              ? IS_DUMPING_ARCHIVE : 0) |
          (is_dumping_static_archive()       ? IS_DUMPING_STATIC_ARCHIVE : 0) |
          (is_logging_lambda_form_invokers() ? IS_LOGGING_LAMBDA_FORM_INVOKERS : 0) |
-         (is_using_archive()                ? IS_USING_ARCHIVE : 0);
+         (is_using_archive()                ? IS_USING_ARCHIVE : 0) |
+         (is_dumping_heap()                 ? IS_DUMPING_HEAP : 0) |
+         (is_tracing_dynamic_proxy()        ? IS_LOGGING_DYNAMIC_PROXIES : 0) |
+         (is_dumping_packages()             ? IS_DUMPING_PACKAGES : 0);
 }
 
 
 void CDSConfig::initialize() {
-  if (is_dumping_static_archive()) {
+  if (is_dumping_static_archive() && !is_dumping_final_static_archive()) {
     if (RequireSharedSpaces) {
       warning("Cannot dump shared archive while using shared archive");
     }
@@ -134,6 +145,13 @@ void CDSConfig::extract_shared_archive_paths(const char* archive_path,
   *top_archive_path = cur_path;
 }
 
+static void set_new_workflow_default_CachedCodeFile() {
+  size_t len = strlen(CacheDataStore) + 6;
+  char* file = AllocateHeap(len, mtArguments);
+  jio_snprintf(file, len, "%s.code", CacheDataStore);
+  FLAG_SET_ERGO(CachedCodeFile, file);
+}
+
 void CDSConfig::init_shared_archive_paths() {
   if (ArchiveClassesAtExit != nullptr) {
     assert(!RecordDynamicDumpInfo, "already checked");
@@ -157,6 +175,10 @@ void CDSConfig::init_shared_archive_paths() {
     if (is_dumping_archive() && archives > 1) {
       vm_exit_during_initialization(
         "Cannot have more than 1 archive file specified in -XX:SharedArchiveFile during CDS dumping");
+    }
+
+    if (CDSPreimage != nullptr && archives > 1) {
+      vm_exit_during_initialization("CDSPreimage must point to a single file", CDSPreimage);
     }
 
     if (is_dumping_static_archive()) {
@@ -183,6 +205,10 @@ void CDSConfig::init_shared_archive_paths() {
         bool success =
           FileMapInfo::get_base_archive_name_from_header(SharedArchiveFile, &base_archive_path);
         if (!success) {
+          if (CDSPreimage != nullptr) {
+            vm_exit_during_initialization("Unable to map shared spaces from CDSPreimage", CDSPreimage);
+          }
+
           // If +AutoCreateSharedArchive and the specified shared archive does not exist,
           // regenerate the dynamic archive base on default archive.
           if (AutoCreateSharedArchive && !os::file_exists(SharedArchiveFile)) {
@@ -326,8 +352,120 @@ bool CDSConfig::has_unsupported_runtime_module_options() {
 }
 
 bool CDSConfig::check_vm_args_consistency(bool patch_mod_javabase, bool mode_flag_cmd_line) {
+  if (CacheDataStore != nullptr) {
+    if (FLAG_IS_DEFAULT(PreloadSharedClasses)) {
+      // New workflow - enable PreloadSharedClasses by default.
+      // TODO: make new workflow work, even when PreloadSharedClasses is false.
+      //
+      // NOTE: in old workflow, we cannot enable PreloadSharedClasses by default. That
+      // should be an opt-in option, per JEP nnn.
+      FLAG_SET_ERGO(PreloadSharedClasses, true);
+    }
+
+    if (SharedArchiveFile != nullptr) {
+      vm_exit_during_initialization("CacheDataStore and SharedArchiveFile cannot be both specified");
+    }
+    if (!PreloadSharedClasses) {
+      // TODO: in the forked JVM, we should ensure all classes are loaded from the hotspot.cds.preimage.
+      // PreloadSharedClasses only loads the classes for built-in loaders. We need to load the classes
+      // for custom loaders as well.
+      vm_exit_during_initialization("CacheDataStore requires PreloadSharedClasses");
+    }
+
+    if (CDSPreimage == nullptr) {
+      if (os::file_exists(CacheDataStore) /* && TODO: CDS file is valid*/) {
+        // The CacheDataStore is already up to date. Use it. Also turn on cached code by default.
+        SharedArchiveFile = CacheDataStore;
+        FLAG_SET_ERGO_IF_DEFAULT(ReplayTraining, true);
+        FLAG_SET_ERGO_IF_DEFAULT(LoadCachedCode, true);
+        if (LoadCachedCode && FLAG_IS_DEFAULT(CachedCodeFile)) {
+          set_new_workflow_default_CachedCodeFile();
+        }
+      } else {
+        // The preimage dumping phase -- run the app and write the preimage file
+        size_t len = strlen(CacheDataStore) + 10;
+        char* preimage = AllocateHeap(len, mtArguments);
+        jio_snprintf(preimage, len, "%s.preimage", CacheDataStore);
+
+        UseSharedSpaces = false;
+        enable_dumping_static_archive();
+        SharedArchiveFile = preimage;
+        log_info(cds)("CacheDataStore needs to be updated. Writing %s file", SharedArchiveFile);
+
+        // At VM exit, the module graph may be contaminated with program states. We should rebuild the
+        // module graph when dumping the CDS final image.
+        log_info(cds)("full module graph: disabled when writing CDS preimage");
+        HeapShared::disable_writing();
+        stop_dumping_full_module_graph();
+        FLAG_SET_ERGO(ArchiveInvokeDynamic, false);
+        FLAG_SET_ERGO(ArchivePackages, false);
+
+        FLAG_SET_ERGO_IF_DEFAULT(RecordTraining, true);
+      }
+    } else {
+      // The final image dumping phase -- load the preimage and write the final image file
+      SharedArchiveFile = CDSPreimage;
+      UseSharedSpaces = true;
+      log_info(cds)("Generate CacheDataStore %s from CDSPreimage %s", CacheDataStore, CDSPreimage);
+      // Force -Xbatch for AOT compilation.
+      if (FLAG_SET_CMDLINE(BackgroundCompilation, false) != JVMFlag::SUCCESS) {
+        return false;
+      }
+      Inline = false; // FIXME: this is just for temp debugging.
+      RecordTraining = false; // This will be updated inside MetaspaceShared::preload_and_dump()
+
+      FLAG_SET_ERGO_IF_DEFAULT(ReplayTraining, true);
+      // Settings for AOT
+      FLAG_SET_ERGO_IF_DEFAULT(StoreCachedCode, true);
+      if (StoreCachedCode && FLAG_IS_DEFAULT(CachedCodeFile)) {
+        set_new_workflow_default_CachedCodeFile();
+        // Cannot dump cached code until metadata and heap are dumped.
+        disable_dumping_cached_code();
+      }
+    }
+  } else {
+    // Old workflow
+    if (CDSPreimage != nullptr) {
+      vm_exit_during_initialization("CDSPreimage must be specified only when CacheDataStore is specified");
+    }
+  }
+
+  if (FLAG_IS_DEFAULT(UsePermanentHeapObjects)) {
+    if (StoreCachedCode || PreloadSharedClasses) {
+      FLAG_SET_ERGO(UsePermanentHeapObjects, true);
+    }
+  }
+
+  if (LoadCachedCode) {
+    // This must be true. Cached code is hard-wired to use permanent objects.
+    UsePermanentHeapObjects = true;
+  }
+
+  if (PreloadSharedClasses) {
+    // If PreloadSharedClasses is specified, enable all these optimizations by default.
+    FLAG_SET_ERGO_IF_DEFAULT(ArchiveDynamicProxies, true);
+    FLAG_SET_ERGO_IF_DEFAULT(ArchiveFieldReferences, true);
+    FLAG_SET_ERGO_IF_DEFAULT(ArchiveInvokeDynamic, true);
+  //FLAG_SET_ERGO_IF_DEFAULT(ArchiveLoaderLookupCache, true);
+    FLAG_SET_ERGO_IF_DEFAULT(ArchiveMethodReferences, true);
+    FLAG_SET_ERGO_IF_DEFAULT(ArchivePackages, true);
+    FLAG_SET_ERGO_IF_DEFAULT(ArchiveReflectionData, true);
+  } else {
+    // All of these *might* depend on PreloadSharedClasses. Better be safe than sorry.
+    // TODO: more fine-grained handling.
+    FLAG_SET_ERGO(ArchiveDynamicProxies, false);
+    FLAG_SET_ERGO(ArchiveFieldReferences, false);
+    FLAG_SET_ERGO(ArchiveInvokeDynamic, false);
+    FLAG_SET_ERGO(ArchiveLoaderLookupCache, false);
+    FLAG_SET_ERGO(ArchiveMethodReferences, false);
+    FLAG_SET_ERGO(ArchivePackages, false);
+    FLAG_SET_ERGO(ArchiveReflectionData, false);
+  }
+
   if (is_dumping_static_archive()) {
-    if (!mode_flag_cmd_line) {
+    if (is_dumping_preimage_static_archive() || is_dumping_final_static_archive()) {
+      // Don't tweak execution mode
+    } else if (!mode_flag_cmd_line) {
       // By default, -Xshare:dump runs in interpreter-only mode, which is required for deterministic archive.
       //
       // If your classlist is large and you don't care about deterministic dumping, you can use
@@ -344,6 +482,12 @@ bool CDSConfig::check_vm_args_consistency(bool patch_mod_javabase, bool mode_fla
     // run to another which resulting in non-determinstic CDS archives.
     // Disable UseStringDeduplication while dumping CDS archive.
     UseStringDeduplication = false;
+
+    Arguments::PropertyList_add(new SystemProperty("java.lang.invoke.MethodHandle.NO_SOFT_CACHE", "true", false));
+  } else {
+    // These flags flag are useful only when dumping static archive (which supports archived heap)
+    ArchiveInvokeDynamic = false;
+    ArchivePackages = false;
   }
 
   // RecordDynamicDumpInfo is not compatible with ArchiveClassesAtExit
@@ -385,7 +529,61 @@ bool CDSConfig::check_vm_args_consistency(bool patch_mod_javabase, bool mode_fla
     }
   }
 
+  if (!is_dumping_static_archive() || !PreloadSharedClasses) {
+    // FIXME -- is_dumping_heap() is not yet callable from here, as UseG1GC is not yet set by ergo!
+    //
+    // These optimizations require heap dumping and PreloadSharedClasses, or else
+    // the classes of some archived heap objects may be replaced at runtime.
+    ArchiveInvokeDynamic = false;
+    ArchivePackages = false;
+  }
+
+  if (!ArchiveInvokeDynamic) {
+    ArchiveReflectionData = false; // reflection data use LambdaForm classes
+  }
+
   return true;
+}
+bool CDSConfig::is_dumping_classic_static_archive() {
+  return _is_dumping_static_archive && CacheDataStore == nullptr && CDSPreimage == nullptr;
+}
+
+bool CDSConfig::is_dumping_preimage_static_archive() {
+  return _is_dumping_static_archive && CacheDataStore != nullptr && CDSPreimage == nullptr;
+}
+
+bool CDSConfig::is_dumping_final_static_archive() {
+  if (CDSPreimage != nullptr) {
+    assert(CacheDataStore != nullptr, "must be"); // should have been properly initialized by arguments.cpp
+  }
+
+  // Note: _is_dumping_static_archive is false! // FIXME -- refactor this so it makes more sense!
+  return CacheDataStore != nullptr && CDSPreimage != nullptr;
+}
+
+bool CDSConfig::is_dumping_regenerated_lambdaform_invokers() {
+  if (is_dumping_final_static_archive()) {
+    // Not yet supported in new workflow -- the training data may point
+    // to a method in a lambdaform holder class that was not regenerated
+    // due to JDK-8318064.
+    return false;
+  } else {
+    return is_dumping_archive();
+  }
+}
+
+bool CDSConfig::is_tracing_dynamic_proxy() {
+  return ClassListWriter::is_enabled() || is_dumping_preimage_static_archive();
+}
+
+// Preserve all states that were examined used during dumptime verification, such
+// that the verification result (pass or fail) cannot be changed at runtime.
+//
+// For example, if the verification of ik requires that class A must be a subtype of B,
+// then this relationship between A and B cannot be changed at runtime. I.e., the app
+// cannot load alternative versions of A and B such that A is not a subtype of B.
+bool CDSConfig::preserve_all_dumptime_verification_states(const InstanceKlass* ik) {
+  return PreloadSharedClasses && SystemDictionaryShared::is_builtin(ik);
 }
 
 bool CDSConfig::is_using_archive() {
@@ -393,7 +591,7 @@ bool CDSConfig::is_using_archive() {
 }
 
 bool CDSConfig::is_logging_lambda_form_invokers() {
-  return ClassListWriter::is_enabled() || is_dumping_dynamic_archive();
+  return ClassListWriter::is_enabled() || is_dumping_dynamic_archive() || is_dumping_preimage_static_archive();
 }
 
 void CDSConfig::stop_using_optimized_module_handling() {
@@ -404,8 +602,12 @@ void CDSConfig::stop_using_optimized_module_handling() {
 
 #if INCLUDE_CDS_JAVA_HEAP
 bool CDSConfig::is_dumping_heap() {
-  // heap dump is not supported in dynamic dump
-  return is_dumping_static_archive() && HeapShared::can_write();
+  return is_dumping_static_archive() && !is_dumping_preimage_static_archive()
+    && HeapShared::can_write();
+}
+
+bool CDSConfig::is_loading_heap() {
+  return ArchiveHeapLoader::is_in_use();
 }
 
 bool CDSConfig::is_using_full_module_graph() {
@@ -446,4 +648,44 @@ void CDSConfig::stop_using_full_module_graph(const char* reason) {
     }
   }
 }
+
+bool CDSConfig::is_loading_invokedynamic() {
+  return UseSharedSpaces && is_loading_heap() && _is_loading_invokedynamic;
+}
+
+bool CDSConfig::is_dumping_dynamic_proxy() {
+  return is_dumping_full_module_graph() && is_dumping_invokedynamic();
+}
+
+bool CDSConfig::is_initing_classes_at_dump_time() {
+  return is_dumping_heap() && PreloadSharedClasses;
+}
+
+bool CDSConfig::is_dumping_invokedynamic() {
+  return ArchiveInvokeDynamic && is_dumping_heap();
+}
+
+bool CDSConfig::is_dumping_packages() {
+  return ArchivePackages && is_dumping_heap();
+}
+
+bool CDSConfig::is_loading_packages() {
+  return UseSharedSpaces && is_loading_heap() && _is_loading_packages;
+}
 #endif // INCLUDE_CDS_JAVA_HEAP
+
+// This is allowed by default. We disable it only in the final image dump before the
+// metadata and heap are dumped.
+static bool _is_dumping_cached_code = true;
+
+bool CDSConfig::is_dumping_cached_code() {
+  return _is_dumping_cached_code;
+}
+
+void CDSConfig::disable_dumping_cached_code() {
+  _is_dumping_cached_code = false;
+}
+
+void CDSConfig::enable_dumping_cached_code() {
+  _is_dumping_cached_code = true;
+}

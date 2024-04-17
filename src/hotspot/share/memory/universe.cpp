@@ -64,6 +64,7 @@
 #include "oops/objArrayOop.inline.hpp"
 #include "oops/oop.inline.hpp"
 #include "oops/oopHandle.inline.hpp"
+#include "oops/trainingData.hpp"
 #include "oops/typeArrayKlass.hpp"
 #include "prims/resolvedMethodTable.hpp"
 #include "runtime/arguments.hpp"
@@ -227,6 +228,9 @@ public:
 static BuiltinException _null_ptr_exception;
 static BuiltinException _arithmetic_exception;
 static BuiltinException _virtual_machine_error;
+static BuiltinException _array_index_oob_exception;
+static BuiltinException _array_store_exception;
+static BuiltinException _class_cast_exception;
 
 objArrayOop Universe::the_empty_class_array ()  {
   return (objArrayOop)_the_empty_class_array.resolve();
@@ -244,6 +248,9 @@ oop Universe::the_min_jint_string()               { return _the_min_jint_string.
 oop Universe::null_ptr_exception_instance()       { return _null_ptr_exception.instance(); }
 oop Universe::arithmetic_exception_instance()     { return _arithmetic_exception.instance(); }
 oop Universe::virtual_machine_error_instance()    { return _virtual_machine_error.instance(); }
+oop Universe::array_index_oob_exception_instance() { return _array_index_oob_exception.instance(); }
+oop Universe::array_store_exception_instance()     { return _array_store_exception.instance(); }
+oop Universe::class_cast_exception_instance()      { return _class_cast_exception.instance(); }
 
 oop Universe::the_null_sentinel()                 { return _the_null_sentinel.resolve(); }
 
@@ -300,6 +307,9 @@ void Universe::archive_exception_instances() {
   _null_ptr_exception.store_in_cds();
   _arithmetic_exception.store_in_cds();
   _virtual_machine_error.store_in_cds();
+  _array_index_oob_exception.store_in_cds();
+  _array_store_exception.store_in_cds();
+  _class_cast_exception.store_in_cds();
 }
 
 void Universe::load_archived_object_instances() {
@@ -316,6 +326,9 @@ void Universe::load_archived_object_instances() {
     _null_ptr_exception.load_from_cds();
     _arithmetic_exception.load_from_cds();
     _virtual_machine_error.load_from_cds();
+    _array_index_oob_exception.load_from_cds();
+    _array_store_exception.load_from_cds();
+    _class_cast_exception.load_from_cds();
   }
 }
 #endif
@@ -332,6 +345,9 @@ void Universe::serialize(SerializeClosure* f) {
   _null_ptr_exception.serialize(f);
   _arithmetic_exception.serialize(f);
   _virtual_machine_error.serialize(f);
+  _array_index_oob_exception.serialize(f);
+  _array_store_exception.serialize(f);
+  _class_cast_exception.serialize(f);
 #endif
 
   f->do_ptr(&_fillerArrayKlassObj);
@@ -514,6 +530,10 @@ void Universe::genesis(TRAPS) {
     assert(i == ((objArrayOop)_fullgc_alot_dummy_array.resolve())->length(), "just checking");
   }
   #endif
+
+#if INCLUDE_CDS
+  TrainingData::restore_all_unshareable_info(CHECK);
+#endif
 }
 
 void Universe::initialize_basic_type_mirrors(TRAPS) {
@@ -1080,6 +1100,9 @@ bool universe_post_init() {
   // (used for a cheap & dirty solution in compiler exception handling)
   _null_ptr_exception.init_if_empty(vmSymbols::java_lang_NullPointerException(), CHECK_false);
   _arithmetic_exception.init_if_empty(vmSymbols::java_lang_ArithmeticException(), CHECK_false);
+  _array_index_oob_exception.init_if_empty(vmSymbols::java_lang_ArrayIndexOutOfBoundsException(), CHECK_false);
+  _array_store_exception.init_if_empty(vmSymbols::java_lang_ArrayStoreException(), CHECK_false);
+  _class_cast_exception.init_if_empty(vmSymbols::java_lang_ClassCastException(), CHECK_false);
 
   // Virtual Machine Error for when we get into a situation we can't resolve
   Klass* k = vmClasses::VirtualMachineError_klass();

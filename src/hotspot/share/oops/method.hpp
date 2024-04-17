@@ -60,10 +60,12 @@ class LocalVariableTableElement;
 class AdapterHandlerEntry;
 class MethodData;
 class MethodCounters;
+class MethodTrainingData;
 class ConstMethod;
 class InlineTableSizes;
-class CompiledMethod;
+class nmethod;
 class InterpreterOopMap;
+class SCCEntry;
 
 class Method : public Metadata {
  friend class VMStructs;
@@ -93,14 +95,17 @@ class Method : public Metadata {
   address _i2i_entry;           // All-args-on-stack calling convention
   // Entry point for calling from compiled code, to compiled code if it exists
   // or else the interpreter.
-  volatile address _from_compiled_entry;        // Cache of: _code ? _code->entry_point() : _adapter->c2i_entry()
+  volatile address _from_compiled_entry;     // Cache of: _code ? _code->entry_point() : _adapter->c2i_entry()
   // The entry point for calling both from and to compiled code is
   // "_code->entry_point()".  Because of tiered compilation and de-opt, this
   // field can come and go.  It can transition from null to not-null at any
   // time (whenever a compile completes).  It can transition from not-null to
   // null only at safepoints (because of a de-opt).
-  CompiledMethod* volatile _code;                       // Points to the corresponding piece of native code
-  volatile address           _from_interpreted_entry; // Cache of _code ? _adapter->i2c_entry() : _i2i_entry
+  nmethod* volatile _code;                   // Points to the corresponding piece of native code
+  volatile address  _from_interpreted_entry; // Cache of _code ? _adapter->i2c_entry() : _i2i_entry
+
+  nmethod*  _preload_code;  // preloaded SCCache code
+  SCCEntry* _scc_entry;     // SCCache entry for pre-loading code
 
   // Constructor
   Method(ConstMethod* xconst, AccessFlags access_flags, Symbol* name);
@@ -122,6 +127,7 @@ class Method : public Metadata {
 #if INCLUDE_CDS
   void remove_unshareable_info();
   void restore_unshareable_info(TRAPS);
+  static void restore_archived_method_handle_intrinsic(methodHandle m, TRAPS);
 #endif
 
   // accessors for instance variables
@@ -314,6 +320,11 @@ class Method : public Metadata {
     return _method_data;
   }
 
+  void set_method_data(MethodData* data);
+
+  MethodTrainingData* training_data_or_null() const;
+  bool init_training_data(MethodTrainingData* tdata);
+
   // mark an exception handler as entered (used to prune dead catch blocks in C2)
   void set_exception_handler_entered(int handler_bci);
 
@@ -341,7 +352,7 @@ class Method : public Metadata {
   bool was_never_executed()                     { return !was_executed_more_than(0);  }
 
   static void build_profiling_method_data(const methodHandle& method, TRAPS);
-
+  static bool install_training_method_data(const methodHandle& method);
   static MethodCounters* build_method_counters(Thread* current, Method* m);
 
   int interpreter_invocation_count()            { return invocation_count();          }
@@ -357,10 +368,10 @@ class Method : public Metadata {
   // nmethod/verified compiler entry
   address verified_code_entry();
   bool check_code() const;      // Not inline to avoid circular ref
-  CompiledMethod* code() const;
+  nmethod* code() const;
 
   // Locks CompiledMethod_lock if not held.
-  void unlink_code(CompiledMethod *compare);
+  void unlink_code(nmethod *compare);
   // Locks CompiledMethod_lock if not held.
   void unlink_code();
 
@@ -373,12 +384,22 @@ private:
   }
 
 public:
-  static void set_code(const methodHandle& mh, CompiledMethod* code);
+  static void set_code(const methodHandle& mh, nmethod* code);
   void set_adapter_entry(AdapterHandlerEntry* adapter) {
     _adapter = adapter;
   }
   void set_from_compiled_entry(address entry) {
     _from_compiled_entry =  entry;
+  }
+
+  void set_preload_code(nmethod* code) {
+    _preload_code = code;
+  }
+  void set_scc_entry(SCCEntry* entry) {
+    _scc_entry = entry;
+  }
+  SCCEntry* scc_entry() const {
+    return _scc_entry;
   }
 
   address get_i2c_entry();
@@ -597,6 +618,7 @@ public:
   bool has_compiled_code() const;
 
   bool needs_clinit_barrier() const;
+  bool code_has_clinit_barriers() const;
 
   // sizing
   static int header_size()                       {

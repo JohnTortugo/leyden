@@ -101,7 +101,8 @@ public class MethodHandlesCastFailureTest {
             .setUseVersion(false)
             .addSuffix(mainClass, testPackageName + "." + testClassName);
         output = CDSTestUtils.runWithArchive(runOpts);
-        output.shouldMatch(".class.load. test.java.lang.invoke.MethodHandlesCastFailureTest[$][$]Lambda.*/0x.*source:.*shared.*objects.*file")
-              .shouldHaveExitValue(0);
+        // FIXME:leyden-premain : we disabled archived Lambda proxy classes due to JDK-8307468
+        // output.shouldMatch(".class.load. test.java.lang.invoke.MethodHandlesCastFailureTest[$][$]Lambda.*/0x.*source:.*shared.*objects.*file")
+        //      .shouldHaveExitValue(0);
     }
 }

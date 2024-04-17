@@ -94,8 +94,9 @@ class ClassPathZipEntry: public ClassPathEntry {
   bool is_jar_file() const { return true;  }
   bool from_class_path_attr() const { return _from_class_path_attr; }
   const char* name() const { return _zip_name; }
-  ClassPathZipEntry(jzfile* zip, const char* zip_name, bool is_boot_append, bool from_class_path_attr);
+  ClassPathZipEntry(jzfile* zip, const char* zip_name, bool from_class_path_attr);
   virtual ~ClassPathZipEntry();
+  bool has_entry(JavaThread* current, const char* name);
   u1* open_entry(JavaThread* current, const char* name, jint* filesize, bool nul_terminate);
   ClassFileStream* open_stream(JavaThread* current, const char* name);
 };
@@ -139,6 +140,7 @@ public:
 class ClassLoader: AllStatic {
  public:
   enum ClassLoaderType {
+    OTHER = 0,
     BOOT_LOADER = 1,      /* boot loader */
     PLATFORM_LOADER  = 2, /* PlatformClassLoader */
     APP_LOADER  = 3       /* AppClassLoader */
@@ -150,6 +152,7 @@ class ClassLoader: AllStatic {
   static PerfCounter* _perf_classes_inited;
   static PerfCounter* _perf_class_init_time;
   static PerfCounter* _perf_class_init_selftime;
+  static PerfCounter* _perf_class_init_bytecodes_count;
   static PerfCounter* _perf_classes_verified;
   static PerfCounter* _perf_class_verify_time;
   static PerfCounter* _perf_class_verify_selftime;
@@ -166,6 +169,25 @@ class ClassLoader: AllStatic {
   static PerfCounter* _perf_define_appclass_selftime;
   static PerfCounter* _perf_app_classfile_bytes_read;
   static PerfCounter* _perf_sys_classfile_bytes_read;
+  static PerfCounter* _perf_preload_total_time;
+  static PerfCounter* _perf_preload_time;
+  static PerfCounter* _perf_prelink_time;
+  static PerfCounter* _perf_preinit_time;
+  static PerfCounter* _perf_preresolve_time;
+  static PerfCounter* _perf_ik_link_methods_time;
+  static PerfCounter* _perf_method_adapters_time;
+  static PerfCounter* _perf_ik_link_methods_count;
+  static PerfCounter* _perf_method_adapters_count;
+
+  static PerfTickCounters* _perf_resolve_indy_time;
+  static PerfTickCounters* _perf_resolve_invokehandle_time;
+  static PerfTickCounters* _perf_resolve_mh_time;
+  static PerfTickCounters* _perf_resolve_mt_time;
+
+  static PerfCounter* _perf_resolve_indy_count;
+  static PerfCounter* _perf_resolve_invokehandle_count;
+  static PerfCounter* _perf_resolve_mh_count;
+  static PerfCounter* _perf_resolve_mt_count;
 
   static PerfCounter* _unsafe_defineClassCallCounter;
 
@@ -279,6 +301,30 @@ class ClassLoader: AllStatic {
   static PerfCounter* perf_app_classfile_bytes_read() { return _perf_app_classfile_bytes_read; }
   static PerfCounter* perf_sys_classfile_bytes_read() { return _perf_sys_classfile_bytes_read; }
 
+  static PerfCounter* perf_preload_total_time() { return _perf_preload_total_time; }
+  static PerfCounter* perf_preload_time() { return _perf_preload_time; }
+  static PerfCounter* perf_prelink_time() { return _perf_prelink_time; }
+  static PerfCounter* perf_preinit_time() { return _perf_preinit_time; }
+  static PerfCounter* perf_preresolve_time() { return _perf_preresolve_time; }
+  static PerfCounter* perf_ik_link_methods_time() { return _perf_ik_link_methods_time; }
+  static PerfCounter* perf_method_adapters_time() { return _perf_method_adapters_time; }
+  static PerfCounter* perf_ik_link_methods_count() { return _perf_ik_link_methods_count; }
+  static PerfCounter* perf_method_adapters_count() { return _perf_method_adapters_count; }
+
+  static PerfTickCounters* perf_resolve_invokedynamic_time() { return _perf_resolve_indy_time; }
+  static PerfTickCounters* perf_resolve_invokehandle_time() { return _perf_resolve_invokehandle_time; }
+  static PerfTickCounters* perf_resolve_method_handle_time() { return _perf_resolve_mh_time; }
+  static PerfTickCounters* perf_resolve_method_type_time() { return _perf_resolve_mt_time; }
+
+  static PerfCounter* perf_resolve_invokedynamic_count() { return _perf_resolve_indy_count; }
+  static PerfCounter* perf_resolve_invokehandle_count() { return _perf_resolve_invokehandle_count; }
+  static PerfCounter* perf_resolve_method_handle_count() { return _perf_resolve_mh_count; }
+  static PerfCounter* perf_resolve_method_type_count() { return _perf_resolve_mt_count; }
+
+  static PerfCounter* perf_class_init_bytecodes_count() { return _perf_class_init_bytecodes_count; }
+
+  static void print_counters();
+
   // Record how many calls to Unsafe_DefineClass
   static PerfCounter* unsafe_defineClassCallCounter() {
     return _unsafe_defineClassCallCounter;
@@ -368,12 +414,13 @@ class ClassLoader: AllStatic {
   static jlong class_verify_time_ms();
   static jlong class_link_count();
   static jlong class_link_time_ms();
+  static jlong class_init_bytecodes_count();
 
   // adds a class path to the boot append entries
   static void add_to_boot_append_entries(ClassPathEntry* new_entry);
 
   // creates a class path zip entry (returns null if JAR file cannot be opened)
-  static ClassPathZipEntry* create_class_path_zip_entry(const char *apath, bool is_boot_append);
+  static ClassPathZipEntry* create_class_path_zip_entry(const char *apath);
 
   static bool string_ends_with(const char* str, const char* str_to_find);
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1998, 2024, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2014, Red Hat Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -25,7 +25,7 @@
 
 #include "precompiled.hpp"
 #include "asm/macroAssembler.hpp"
-#include "code/compiledMethod.hpp"
+#include "code/nmethod.hpp"
 #include "code/relocInfo.hpp"
 #include "nativeInst_aarch64.hpp"
 #include "oops/oop.inline.hpp"
@@ -109,4 +109,12 @@ void poll_Relocation::fix_relocation_after_move(const CodeBuffer* src, CodeBuffe
 }
 
 void metadata_Relocation::pd_fix_value(address x) {
+}
+
+address trampoline_stub_Relocation::pd_destination() {
+  return nativeCallTrampolineStub_at(addr())->destination();
+}
+
+void trampoline_stub_Relocation::pd_set_destination(address x) {
+  nativeCallTrampolineStub_at(addr())->set_destination(x);
 }

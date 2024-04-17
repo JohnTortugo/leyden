@@ -142,6 +142,10 @@ private:
         _buffered_addr = nullptr;
       }
     }
+    SourceObjInfo(address src, address buf) {
+      _source_addr = src;
+      _buffered_addr = buf;
+    }
 
     // This constructor is only used for regenerated objects (created by LambdaFormInvokers, etc).
     //   src = address of a Method or InstanceKlass that has been regenerated.
@@ -204,6 +208,7 @@ private:
 
   DumpRegion _rw_region;
   DumpRegion _ro_region;
+  DumpRegion _cc_region;
   CHeapBitMap _ptrmap;    // bitmap used by ArchivePtrMarker
 
   SourceObjList _rw_src_objs;                 // objs to put in rw region
@@ -243,6 +248,7 @@ private:
   void sort_klasses();
   static int compare_symbols_by_address(Symbol** a, Symbol** b);
   static int compare_klass_by_name(Klass** a, Klass** b);
+  void update_hidden_class_loader_type(InstanceKlass* ik) NOT_CDS_JAVA_HEAP_RETURN;
 
   void make_shallow_copies(DumpRegion *dump_region, const SourceObjList* src_objs);
   void make_shallow_copy(DumpRegion *dump_region, SourceObjInfo* src_info);
@@ -276,6 +282,9 @@ public:
   intx buffer_to_requested_delta()           const { return _buffer_to_requested_delta;           }
 
   bool is_in_buffer_space(address p) const {
+    if (current_dump_space() == nullptr) {
+      return false;
+    }
     return (buffer_bottom() <= p && p < buffer_top());
   }
 
@@ -328,8 +337,6 @@ public:
     return to_offset_u4(offset);
   }
 
-  static void assert_is_vm_thread() PRODUCT_RETURN;
-
 public:
   ArchiveBuilder();
   ~ArchiveBuilder();
@@ -343,12 +350,19 @@ public:
 
   DumpRegion* rw_region() { return &_rw_region; }
   DumpRegion* ro_region() { return &_ro_region; }
+  DumpRegion* cc_region() { return &_cc_region; }
+
+  void start_cc_region();
+  void end_cc_region();
 
   static char* rw_region_alloc(size_t num_bytes) {
     return current()->rw_region()->allocate(num_bytes);
   }
   static char* ro_region_alloc(size_t num_bytes) {
     return current()->ro_region()->allocate(num_bytes);
+  }
+  static char* cc_region_alloc(size_t num_bytes) {
+    return current()->cc_region()->allocate(num_bytes);
   }
 
   template <typename T>
@@ -390,6 +404,12 @@ public:
     write_pointer_in_buffer((address*)ptr_location, (address)src_addr);
   }
 
+  void mark_and_relocate_to_buffered_addr(address* ptr_location);
+  template <typename T> void mark_and_relocate_to_buffered_addr(T ptr_location) {
+    mark_and_relocate_to_buffered_addr((address*)ptr_location);
+  }
+
+  bool has_been_archived(address src_addr) const;
   address get_buffered_addr(address src_addr) const;
   template <typename T> T get_buffered_addr(T src_addr) const {
     return (T)get_buffered_addr((address)src_addr);
@@ -405,11 +425,11 @@ public:
   GrowableArray<Symbol*>* symbols() const { return _symbols; }
 
   static bool is_active() {
-    return (_current != nullptr);
+    CDS_ONLY(return (_current != nullptr));
+    NOT_CDS(return false;)
   }
 
   static ArchiveBuilder* current() {
-    assert_is_vm_thread();
     assert(_current != nullptr, "ArchiveBuilder must be active");
     return _current;
   }

@@ -24,6 +24,7 @@
 
 #include "precompiled.hpp"
 #include "cds/archiveBuilder.hpp"
+#include "cds/cdsConfig.hpp"
 #include "cds/dumpTimeClassInfo.inline.hpp"
 #include "cds/runTimeClassInfo.hpp"
 #include "classfile/classLoader.hpp"
@@ -40,6 +41,30 @@ DumpTimeClassInfo::~DumpTimeClassInfo() {
   if (_loader_constraints != nullptr) {
     delete _loader_constraints;
   }
+}
+
+bool DumpTimeClassInfo::is_excluded() {
+  if (_excluded) {
+    return true;
+  }
+  if (_failed_verification) {
+    if (CDSConfig::preserve_all_dumptime_verification_states(_klass)) {
+      assert(PreloadSharedClasses, "sanity");
+      // If the verification states are preserved, _klass will be archived in unlinked state. This is
+      // necessary to support the following scenario, where the verification of X requires that
+      // A be a subclass of B:
+      //     class X {
+      //        B getB() { return new A(); }
+      //     }
+      // If X and B can be verified, but A fails verification, we still archive A (in a preloaded
+      // SystemDictionary) so that at runtime we cannot subvert the verification of X by replacing
+      // A with a version that is not a subtype of B.
+    } else {
+      // Don't archive this class. At runtime, load it from classfile and rerun verification.
+      return true;
+    }
+  }
+  return false;
 }
 
 size_t DumpTimeClassInfo::runtime_info_bytesize() const {
@@ -143,16 +168,22 @@ bool DumpTimeClassInfo::is_builtin() {
 }
 
 DumpTimeClassInfo* DumpTimeSharedClassTable::allocate_info(InstanceKlass* k) {
-  assert(!k->is_shared(), "Do not call with shared classes");
+  if (!CDSConfig::is_dumping_final_static_archive()) {
+    assert(!k->is_shared(), "Do not call with shared classes");
+  }
   bool created;
   DumpTimeClassInfo* p = put_if_absent(k, &created);
   assert(created, "must not exist in table");
   p->_klass = k;
+  //ResourceMark rm;
+  //tty->print_cr("allocate_info %p %s", k, k->external_name());
   return p;
 }
 
 DumpTimeClassInfo* DumpTimeSharedClassTable::get_info(InstanceKlass* k) {
-  assert(!k->is_shared(), "Do not call with shared classes");
+  if (!CDSConfig::is_dumping_final_static_archive()) {
+    assert(!k->is_shared(), "Do not call with shared classes");
+  }
   DumpTimeClassInfo* p = get(k);
   assert(p != nullptr, "we must not see any non-shared InstanceKlass* that's "
          "not stored with SystemDictionaryShared::init_dumptime_info");

@@ -24,24 +24,33 @@
  */
 
 #include "precompiled.hpp"
+#include "c1/c1_Runtime1.hpp"
 #include "cds/cds_globals.hpp"
 #include "cds/cdsConfig.hpp"
+#include "cds/classPreloader.hpp"
+#include "cds/heapShared.hpp"
 #include "cds/metaspaceShared.hpp"
+#include "cds/methodProfiler.hpp"
 #include "classfile/classLoader.hpp"
 #include "classfile/javaClasses.hpp"
 #include "classfile/javaThreadStatus.hpp"
 #include "classfile/systemDictionary.hpp"
+#include "classfile/systemDictionaryShared.hpp"
 #include "classfile/vmClasses.hpp"
 #include "classfile/vmSymbols.hpp"
+#include "code/SCCache.hpp"
+#include "compiler/compilationPolicy.hpp"
 #include "compiler/compileBroker.hpp"
 #include "compiler/compileTask.hpp"
 #include "compiler/compilerThread.hpp"
+#include "compiler/precompiler.hpp"
 #include "gc/shared/barrierSet.hpp"
 #include "gc/shared/barrierSetNMethod.hpp"
 #include "gc/shared/gcVMOperations.hpp"
 #include "gc/shared/oopStorage.hpp"
 #include "gc/shared/oopStorageSet.hpp"
 #include "gc/shared/stringdedup/stringDedup.hpp"
+#include "interpreter/interpreterRuntime.hpp"
 #include "jfr/jfrEvents.hpp"
 #include "jvm.h"
 #include "jvmtifiles/jvmtiEnv.hpp"
@@ -57,6 +66,7 @@
 #include "oops/instanceKlass.hpp"
 #include "oops/klass.inline.hpp"
 #include "oops/oop.inline.hpp"
+#include "opto/runtime.hpp"
 #include "oops/symbol.hpp"
 #include "prims/jvm_misc.hpp"
 #include "prims/jvmtiAgentList.hpp"
@@ -320,6 +330,17 @@ static void call_initPhase2(TRAPS) {
   }
 
   universe_post_module_init();
+
+  // Preload all boot classes outside of java.base module
+  ClassPreloader::runtime_preload(THREAD, Handle());
+  if (CDSConfig::is_using_full_module_graph()) {
+    // SystemDictionary::java_{platform,system}_loader are already assigned. We can spin
+    // this up a little quicker.
+    assert(SystemDictionary::java_platform_loader() != nullptr, "must be");
+    assert(SystemDictionary::java_system_loader() != nullptr,   "must be");
+    ClassPreloader::runtime_preload(THREAD, Handle(THREAD, SystemDictionary::java_platform_loader()));
+    ClassPreloader::runtime_preload(THREAD, Handle(THREAD, SystemDictionary::java_system_loader()));
+  }
 }
 
 // Phase 3. final setup - set security manager, system class loader and TCCL
@@ -352,6 +373,8 @@ void Threads::initialize_java_lang_classes(JavaThread* main_thread, TRAPS) {
   Universe::set_main_thread_group(thread_group());
   initialize_class(vmSymbols::java_lang_Thread(), CHECK);
   create_initial_thread(thread_group, main_thread, CHECK);
+
+  HeapShared::init_box_classes(CHECK);
 
   // The VM creates objects of this class.
   initialize_class(vmSymbols::java_lang_Module(), CHECK);
@@ -401,6 +424,38 @@ void Threads::initialize_java_lang_classes(JavaThread* main_thread, TRAPS) {
   initialize_class(vmSymbols::java_lang_IllegalArgumentException(), CHECK);
 }
 
+bool Threads::initialize_compilation(TRAPS) {
+  // initialize compiler(s)
+  bool force_JVMCI_initialization = false;
+
+#if defined(COMPILER1) || COMPILER2_OR_JVMCI
+  bool init_compilation = true;
+#if INCLUDE_JVMCI
+  if (EnableJVMCI) {
+    // Initialize JVMCI eagerly when it is explicitly requested.
+    // Or when JVMCILibDumpJNIConfig or JVMCIPrintProperties is enabled.
+    force_JVMCI_initialization = EagerJVMCI || JVMCIPrintProperties || JVMCILibDumpJNIConfig;
+    if (!force_JVMCI_initialization && UseJVMCICompiler && !UseJVMCINativeLibrary && (!UseInterpreter || !BackgroundCompilation)) {
+      // Force initialization of jarjvmci otherwise requests for blocking
+      // compilations will not actually block until jarjvmci is initialized.
+      force_JVMCI_initialization = true;
+    }
+    if (JVMCIPrintProperties || JVMCILibDumpJNIConfig) {
+      // Both JVMCILibDumpJNIConfig and JVMCIPrintProperties exit the VM
+      // so compilation should be disabled. This prevents dumping or
+      // printing from happening more than once.
+      init_compilation = false;
+    }
+  }
+#endif
+  if (init_compilation) {
+    CompileBroker::compilation_init(CHECK_false);
+  }
+#endif
+
+  return force_JVMCI_initialization;
+}
+
 void Threads::initialize_jsr292_core_classes(TRAPS) {
   TraceTime timer("Initialize java.lang.invoke classes", TRACETIME_LOG(Info, startuptime));
 
@@ -408,6 +463,10 @@ void Threads::initialize_jsr292_core_classes(TRAPS) {
   initialize_class(vmSymbols::java_lang_invoke_ResolvedMethodName(), CHECK);
   initialize_class(vmSymbols::java_lang_invoke_MemberName(), CHECK);
   initialize_class(vmSymbols::java_lang_invoke_MethodHandleNatives(), CHECK);
+
+  if (UseSharedSpaces) {
+    HeapShared::initialize_java_lang_invoke(CHECK);
+  }
 }
 
 jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
@@ -533,6 +592,8 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   main_thread->set_active_handles(JNIHandleBlock::allocate_block());
   MACOS_AARCH64_ONLY(main_thread->init_wx());
 
+  MutexLockerImpl::init_counters(); // depends on mutex_init(), perfMemory_init(), and Thread::initialize_thread_current().
+
   if (!main_thread->set_as_starting_thread()) {
     vm_shutdown_during_initialization(
                                       "Failed necessary internal allocation. Out of swap space");
@@ -549,6 +610,9 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   ObjectMonitor::Initialize();
   ObjectSynchronizer::initialize();
 
+  Deoptimization::init_counters();
+  VMThread::init_counters();
+
   // Initialize global modules
   jint status = init_globals();
   if (status != JNI_OK) {
@@ -556,6 +620,9 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
     *canTryAgain = false; // don't let caller call JNI_CreateJavaVM again
     return status;
   }
+  if (xtty != nullptr)
+    xtty->elem("vm_main_thread thread='" UINTX_FORMAT "'",
+               (uintx) main_thread->osthread()->thread_id());
 
   // Create WatcherThread as soon as we can since we need it in case
   // of hangs during error reporting.
@@ -693,32 +760,12 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   // Start the monitor deflation thread:
   MonitorDeflationThread::initialize();
 
-  // initialize compiler(s)
-#if defined(COMPILER1) || COMPILER2_OR_JVMCI
-  bool init_compilation = true;
-#if INCLUDE_JVMCI
-  bool force_JVMCI_initialization = false;
-  if (EnableJVMCI) {
-    // Initialize JVMCI eagerly when it is explicitly requested.
-    // Or when JVMCILibDumpJNIConfig or JVMCIPrintProperties is enabled.
-    force_JVMCI_initialization = EagerJVMCI || JVMCIPrintProperties || JVMCILibDumpJNIConfig;
-    if (!force_JVMCI_initialization && UseJVMCICompiler && !UseJVMCINativeLibrary && (!UseInterpreter || !BackgroundCompilation)) {
-      // Force initialization of jarjvmci otherwise requests for blocking
-      // compilations will not actually block until jarjvmci is initialized.
-      force_JVMCI_initialization = true;
-    }
-    if (JVMCIPrintProperties || JVMCILibDumpJNIConfig) {
-      // Both JVMCILibDumpJNIConfig and JVMCIPrintProperties exit the VM
-      // so compilation should be disabled. This prevents dumping or
-      // printing from happening more than once.
-      init_compilation = false;
-    }
-  }
-#endif
-  if (init_compilation) {
-    CompileBroker::compilation_init(CHECK_JNI_ERR);
-  }
-#endif
+  // Start the method sampler
+  MethodProfiler::initialize();
+
+  bool force_JVMCI_initialization = initialize_compilation(CHECK_JNI_ERR);
+
+  ClassPreloader::init_javabase_preloaded_classes(CHECK_JNI_ERR);
 
   // Start string deduplication thread if requested.
   if (StringDedup::is_enabled()) {
@@ -750,6 +797,11 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   // cache the system and platform class loaders
   SystemDictionary::compute_java_loaders(CHECK_JNI_ERR);
 
+  // Initiate replay training processing once preloading is over.
+  CompileBroker::init_training_replay();
+
+  ClassPreloader::replay_training_at_init_for_preloaded_classes(CHECK_JNI_ERR);
+
   if (Continuations::enabled()) {
     // Initialize Continuation class now so that failure to create enterSpecial/doYield
     // special nmethods due to limited CodeCache size can be treated as a fatal error at
@@ -770,6 +822,20 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   if (force_JVMCI_initialization) {
     JVMCI::initialize_compiler(CHECK_JNI_ERR);
   }
+#endif
+
+  if (PrecompileCode) {
+    Precompiler::compile_cached_code(CHECK_JNI_ERR);
+    if (PrecompileOnlyAndExit) {
+      SCCache::close();
+      log_vm_init_stats();
+      vm_direct_exit(0, "Code precompiation is over");
+    }
+  }
+
+#if defined(COMPILER2)
+  // Pre-load cached compiled methods
+  SCCache::preload_code(CHECK_JNI_ERR);
 #endif
 
   if (NativeHeapTrimmer::enabled()) {
@@ -824,8 +890,33 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   _vm_complete = true;
 #endif
 
-  if (CDSConfig::is_dumping_static_archive()) {
+  if (CDSConfig::is_dumping_classic_static_archive()) {
+    // Classic -Xshare:dump, aka "old workflow"
     MetaspaceShared::preload_and_dump();
+  } else if (CDSConfig::is_dumping_final_static_archive()) {
+    // TODO: copy the verification and loader constraints from preimage to final image
+    // TODO: load archived classes for custom loaders as well.
+    log_info(cds)("Dumping final image of CacheDataStore %s", CacheDataStore);
+    MetaspaceShared::preload_and_dump();
+    vm_direct_exit(0, "CacheDataStore dumping is complete");
+  }
+
+  log_info(init)("Before main:");
+  log_vm_init_stats();
+
+  if (UsePerfData) {
+    if (ProfileVMLocks) {
+      main_thread->set_profile_vm_locks(true);
+    }
+    if (ProfileVMCalls) {
+      main_thread->set_profile_vm_calls(true);
+    }
+    if (ProfileRuntimeCalls) {
+      main_thread->set_profile_rt_calls(true);
+    }
+    if (ProfileVMOps) {
+      main_thread->set_profile_vm_ops(true);
+    }
   }
 
   return JNI_OK;

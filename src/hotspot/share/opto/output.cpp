@@ -3378,14 +3378,12 @@ uint PhaseOutput::scratch_emit_size(const Node* n) {
 }
 
 void PhaseOutput::install() {
-  if (!C->should_install_code()) {
-    return;
-  } else if (C->stub_function() != nullptr) {
+  if (C->should_install_code() && C->stub_function() != nullptr) {
     install_stub(C->stub_name());
   } else {
     install_code(C->method(),
                  C->entry_bci(),
-                 CompileBroker::compiler2(),
+                 CompilerThread::current()->compiler(),
                  C->has_unsafe_access(),
                  SharedRuntime::is_wide_vector(C->max_vector_size()),
                  C->rtm_state());
@@ -3432,14 +3430,26 @@ void PhaseOutput::install_code(ciMethod*         target,
                                      &_handler_table,
                                      inc_table(),
                                      compiler,
+                                     C->has_clinit_barriers(),
+                                     C->for_preload(),
                                      has_unsafe_access,
                                      SharedRuntime::is_wide_vector(C->max_vector_size()),
                                      C->has_monitors(),
                                      0,
+                                     C->should_install_code(),
                                      C->rtm_state());
 
     if (C->log() != nullptr) { // Print code cache state into compiler log
       C->log()->code_cache_state();
+    }
+    if (C->has_clinit_barriers()) {
+      assert(C->for_preload(), "sanity");
+      // Build second version of code without class initialization barriers
+      if (C->env()->task()->compile_reason() == CompileTask::Reason_PrecompileForPreload) {
+        // don't automatically precompile a barrier-free version unless explicitly asked
+      } else {
+        C->record_failure(C2Compiler::retry_no_clinit_barriers());
+      }
     }
   }
 }
